@@ -1,0 +1,23 @@
+# Secrets: settings live in Render's Environment tab (or a local .env), never in git
+.env
+.env.*
+
+# Local databases, and backups (they hold customer data)
+*.db
+*.db-shm
+*.db-wal
+backups/
+logs/
+
+# Python
+__pycache__/
+.pytest_cache/
+.venv/
+venv/
+build/
+dist/
+
+# Editors
+.DS_Store
+.vscode/
+.idea/

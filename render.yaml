@@ -1,0 +1,39 @@
+# Render Blueprint: the API as a Render web service, on Render's own Python runtime (no Docker).
+# Render dashboard > New > Blueprint > choose this repository. Render asks once for every value marked
+# sync: false; JWT_SECRET is generated for you.
+# The API creates and upgrades its tables in the Neon database by itself on every start.
+services:
+  - type: web
+    name: kannagi-night-mart-api
+    runtime: python
+    region: singapore # next to the Neon database (ap-southeast-1) and close to the hostel
+    # Free instances sleep after 15 minutes without requests and take up to a minute to wake;
+    # a paid instance type never sleeps.
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT --workers ${WEB_CONCURRENCY:-1} --no-server-header --no-access-log
+    # Answers without the internal key; every other path answers 404 to anyone without it.
+    healthCheckPath: /api/health
+    # Deploy a commit only after its GitHub checks pass (.github/workflows/ci.yml).
+    # Python's version is pinned by .python-version.
+    autoDeployTrigger: checksPass
+    envVars:
+      - key: ENVIRONMENT
+        value: production # refuses to start with weak secrets or without a Postgres DATABASE_URL
+      - key: SHOP_TIMEZONE
+        value: Asia/Kolkata
+      - key: DATABASE_URL
+        sync: false # the Neon *pooled* connection string (host contains "-pooler")
+      - key: JWT_SECRET
+        generateValue: true
+      - key: INTERNAL_API_KEY
+        sync: false # the same value as INTERNAL_API_KEY where the website runs
+      # The main admin's sign-in at /admin; it adds the shopkeepers and other admins there.
+      - key: ADMIN_MOBILE
+        sync: false # 10-digit mobile number
+      - key: ADMIN_PASSWORD
+        sync: false # 8+ characters; changing it here (and redeploying) changes the main admin's password
+      - key: CLOUDINARY_URL
+        sync: false # cloudinary://<api_key>:<api_secret>@<cloud_name>
+      - key: CLOUDINARY_FOLDER
+        value: kannagi-night-mart

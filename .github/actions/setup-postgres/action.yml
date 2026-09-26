@@ -1,0 +1,24 @@
+# An empty Postgres 18 (the version the Neon database runs), installed on the runner itself: no Docker.
+name: Set up Postgres 18
+description: Starts an empty, throwaway Postgres 18 on the runner and gives its connection string.
+outputs:
+  url:
+    description: Connection string of the empty database
+    value: postgresql://postgres@127.0.0.1:5499/postgres
+runs:
+  using: composite
+  steps:
+    - name: Install and start Postgres 18
+      shell: bash
+      run: |
+        set -euo pipefail
+        pgdg=/usr/share/postgresql-common/pgdg/apt.postgresql.org.sh # adds PostgreSQL's official apt repository
+        if [ ! -x "$pgdg" ]; then sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-common > /dev/null; fi
+        # Only the programs: the database below lives in the job's temp folder and goes away with it.
+        echo "create_main_cluster = false" | sudo tee -a /etc/postgresql-common/createcluster.conf > /dev/null
+        sudo "$pgdg" -y > /dev/null
+        sudo apt-get install -y -qq postgresql-18 > /dev/null
+        bin=/usr/lib/postgresql/18/bin
+        "$bin/initdb" -D "$RUNNER_TEMP/postgres" -U postgres --auth=trust > /dev/null
+        "$bin/pg_ctl" -D "$RUNNER_TEMP/postgres" -l "$RUNNER_TEMP/postgres.log" -o "-p 5499 -k $RUNNER_TEMP" -w start
+        "$bin/psql" -tA "postgresql://postgres@127.0.0.1:5499/postgres" -c "select version()"

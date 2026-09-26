@@ -1,0 +1,94 @@
+# Checks the API on every push to main and every pull request.
+# Deploying is Render's side: render.yaml sets autoDeployTrigger: checksPass, so Render deploys a commit
+# to the live shop only after every check on it passes. A commit that fails here is never deployed.
+name: API
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One run at a time per branch, oldest first, so Render deploys commits in order. Pull requests only
+# need their newest commit checked.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version-file: .python-version
+      - run: pip install "pyflakes>=3,<5"
+      - name: Lint (unused imports, undefined names)
+        run: python -m pyflakes app
+
+  render-start:
+    name: Starts the way Render starts it
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version-file: .python-version
+          cache: pip
+          cache-dependency-path: requirements.txt
+      - id: postgres
+        uses: ./.github/actions/setup-postgres
+      - name: Read the API service from render.yaml
+        run: |
+          api='.services[] | select(.name == "kannagi-night-mart-api")'
+          echo "BUILD_COMMAND=$(yq "$api | .buildCommand" render.yaml)" >> "$GITHUB_ENV"
+          echo "START_COMMAND=$(yq "$api | .startCommand" render.yaml)" >> "$GITHUB_ENV"
+          # The fixed values render.yaml sets (ENVIRONMENT=production, ...).
+          yq "$api | .envVars[] | select(has(\"value\")) | .key + \"=\" + .value" render.yaml | tee -a "$GITHUB_ENV"
+      - name: Build command (only requirements.txt, as on Render)
+        run: bash -c "$BUILD_COMMAND"
+      - name: Start command, then check it answers like the live API
+        env:
+          RENDER: "true" # Render sets this on its servers
+          PORT: "10000"
+          DATABASE_URL: ${{ steps.postgres.outputs.url }}
+          # Stand-ins for the values typed into the Render dashboard. Used only by this check.
+          JWT_SECRET: ci-only-jwt-secret-for-this-check-000000000
+          INTERNAL_API_KEY: ci-only-internal-key-for-this-check-0000000
+          ADMIN_MOBILE: "9000000100"
+          ADMIN_PASSWORD: ci-only-admin-password
+        run: |
+          set -euo pipefail
+          bash -c "$START_COMMAND" > "$RUNNER_TEMP/api.log" 2>&1 &
+          server=$!
+          api="http://127.0.0.1:$PORT/api"
+          for _ in $(seq 60); do
+            curl -fs "$api/health" > /dev/null && break
+            kill -0 "$server" 2> /dev/null || { echo "::error::The API stopped while starting: see the API log step."; exit 1; }
+            sleep 1
+          done
+          expect() { # expect <status> <curl arguments...>
+            local want=$1 got; shift
+            got=$(curl -s -o /dev/null -w "%{http_code}" "$@" || true) # 000 when nothing answers
+            echo "$got ${*: -1}"
+            [ "$got" = "$want" ] || { echo "::error::Expected $want, got $got"; exit 1; }
+          }
+          key=(-H "X-Internal-Key: $INTERNAL_API_KEY" -H "Content-Type: application/json")
+          expect 200 "$api/health"
+          expect 404 "$api/auth/me" # without the internal key every other path is hidden
+          expect 401 "${key[@]}" "$api/auth/me"
+          expect 422 "${key[@]}" -d '{"email":"ci@example.com","password":"password123"}' "$api/auth/signup" # mobile number required
+          expect 201 "${key[@]}" -d '{"email":"ci@example.com","password":"password123","mobile":"9123456789"}' "$api/auth/signup"
+          # The main admin was made from ADMIN_MOBILE / ADMIN_PASSWORD at start-up.
+          expect 200 "${key[@]}" -d "{\"phone\":\"$ADMIN_MOBILE\",\"password\":\"$ADMIN_PASSWORD\"}" "$api/auth/admin-login"
+          kill "$server"
+      - name: API log
+        if: failure()
+        run: cat "$RUNNER_TEMP/api.log"
