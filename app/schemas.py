@@ -13,6 +13,7 @@ OfferId = Literal["tier50", "tier100", "first", "bulk"]
 Block = Literal["A", "B", "C"]
 Delivery = Literal["Pickup", "Room Delivery"]
 Payment = Literal["UPI", "Pay on Delivery"]
+ManualPayment = Literal["Cash", "UPI"]  # how an in-person sale was paid
 StoreOverride = Literal["auto", "online", "offline"]
 # Which reward applies when a spin coupon and an automatic offer both could: the bigger saving, or always the coupon.
 CouponRule = Literal["best", "coupon"]
@@ -239,13 +240,59 @@ class SoldItem(CamelModel):
     qty: int
 
 
-class SalesSummary(CamelModel):
-    """All-time totals, computed by the database so the dashboard doesn't download every order."""
+class SalesFigures(CamelModel):
+    count: int  # sales: orders, or manual sales
+    items: int  # units sold
+    revenue: float
+    investment: float  # purchase cost (MRP) of the items sold; profit is revenue - investment
 
-    order_count: int
+
+class SalesSummary(CamelModel):
+    """All-time totals, computed by the database so the dashboard doesn't download every order. Online
+    orders and manual (in-person) sales separately, and together in revenue, investment and sold."""
+
+    order_count: int  # every order placed, cancelled and unpaid ones too
     revenue: float
     investment: float  # purchase cost of the items sold
     sold: list[SoldItem]
+    online: SalesFigures
+    manual: SalesFigures
+
+
+# --- manual (in-person) sales ---
+
+
+class ManualSaleItemIn(CamelModel):
+    product_id: int = Field(gt=0, le=MAX_ID)
+    quantity: int = Field(gt=0, le=1000)
+
+
+class ManualSaleIn(Stripped):
+    items: list[ManualSaleItemIn] = Field(min_length=1, max_length=50)
+    payment: ManualPayment = "Cash"
+    # What was received. Left out: the shop's prices (MRP + markup, eggs as online).
+    amount: float | None = Field(default=None, ge=0, le=100_000)
+    note: str | None = Field(default=None, max_length=100)  # e.g. who bought it
+
+    _check_amount = field_validator("amount")(classmethod(_price))
+
+
+class ManualSaleItemOut(CamelModel):
+    name: str
+    qty: int
+    price: float  # the shop's price each when sold
+
+
+class ManualSaleOut(CamelModel):
+    id: int
+    created_at: int  # epoch milliseconds
+    items: list[ManualSaleItemOut]
+    total: float
+    investment: float
+    payment: ManualPayment
+    note: str | None = None
+    recorded_by: str | None = None
+    cancelled: bool
 
 
 class StoreStatus(CamelModel):
@@ -513,7 +560,8 @@ class AdminOverview(CamelModel):
     admins: int
     blocked: int
     orders_today: int
-    revenue_today: float
+    manual_sales_today: int
+    revenue_today: float  # online orders (paid) and manual sales
     open_orders: int
     awaiting_payment: int
     store_online: bool

@@ -17,7 +17,7 @@ from sqlalchemy.orm import Session, selectinload
 from .. import site, sync
 from ..config import settings
 from ..database import get_db, takes_turns
-from ..models import Order, Product, Profile, ResetRequest, Spin, User, WishRequest, utcnow
+from ..models import ManualSale, Order, Product, Profile, ResetRequest, Spin, User, WishRequest, utcnow
 from ..schemas import (
     MAX_ID,
     AdminOrderOut,
@@ -67,6 +67,9 @@ def overview(db: Session = Depends(get_db)) -> AdminOverview:
     midnight = datetime.combine(shop_now().date(), time(), tzinfo=settings.tz).astimezone(timezone.utc).replace(tzinfo=None)
     live = Order.cancelled.is_(False)
     paid = or_(Order.payment != "UPI", Order.payment_confirmed.is_(True))
+    manual_today = and_(ManualSale.cancelled.is_(False), ManualSale.created_at >= midnight)
+    online_today = float(db.scalar(select(func.coalesce(func.sum(Order.total), 0)).where(live, paid, Order.created_at >= midnight)) or 0)
+    manual_money_today = float(db.scalar(select(func.coalesce(func.sum(ManualSale.total), 0)).where(manual_today)) or 0)
     shop = site.values(db)
 
     def people(*where) -> int:
@@ -78,7 +81,8 @@ def overview(db: Session = Depends(get_db)) -> AdminOverview:
         admins=people(User.is_admin.is_(True)),
         blocked=people(User.blocked.is_(True)),
         orders_today=db.scalar(select(func.count()).where(live, Order.created_at >= midnight)) or 0,
-        revenue_today=round(float(db.scalar(select(func.coalesce(func.sum(Order.total), 0)).where(live, paid, Order.created_at >= midnight)) or 0), 2),
+        manual_sales_today=db.scalar(select(func.count(ManualSale.id)).where(manual_today)) or 0,
+        revenue_today=round(online_today + manual_money_today, 2),
         open_orders=db.scalar(select(func.count()).where(live, Order.fulfilled.is_(False))) or 0,
         awaiting_payment=db.scalar(select(func.count()).where(live, Order.payment == "UPI", Order.payment_confirmed.is_(False))) or 0,
         store_online=store_online(get_settings(db), shop.open_hour, shop.close_hour),

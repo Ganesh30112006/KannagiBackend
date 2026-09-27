@@ -121,6 +121,42 @@ class OrderItem(Base):
     order: Mapped[Order] = relationship(back_populates="items")
 
 
+class ManualSale(Base):
+    """A sale made in person (at the shop's room, outside the website), entered by a shopkeeper or admin on
+    the dashboard. Its items come off the stock and it counts in sales and profit, like an order."""
+
+    __tablename__ = "manual_sales"
+    # AUTOINCREMENT so sale numbers are never reused.
+    __table_args__ = {"sqlite_autoincrement": True}
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    # What was received: the shop's prices unless the shopkeeper entered another amount.
+    total: Mapped[float] = mapped_column(Float)
+    payment: Mapped[str] = mapped_column(String(10))  # Cash or UPI
+    note: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    # Who entered it, as their sign-in number (text, so it stays readable after the account is gone).
+    recorded_by: Mapped[str | None] = mapped_column(String(320), nullable=True)
+    # Undone (entered by mistake): its items went back on the shelf and it no longer counts anywhere.
+    cancelled: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
+
+    items: Mapped[list["ManualSaleItem"]] = relationship(back_populates="sale", cascade="all, delete-orphan")
+
+
+class ManualSaleItem(Base):
+    __tablename__ = "manual_sale_items"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    sale_id: Mapped[int] = mapped_column(ForeignKey("manual_sales.id", ondelete="CASCADE"), index=True)
+    product_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    product_name: Mapped[str] = mapped_column(String(80))
+    quantity: Mapped[int] = mapped_column(Integer)
+    purchase_price: Mapped[float] = mapped_column(Float)  # MRP when sold: the cost, for profit
+    sale_price: Mapped[float] = mapped_column(Float)  # the shop's price each when sold
+
+    sale: Mapped[ManualSale] = relationship(back_populates="items")
+
+
 class MartSettings(Base):
     """Single-row table (id=1) with shop-wide settings editable by the shopkeeper."""
 

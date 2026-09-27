@@ -1,6 +1,6 @@
 # Kannagi Night Mart API
 
-The API behind the Kannagi Night Mart website: accounts, catalog, orders, offers, the spin wheel and the admin console. FastAPI + SQLAlchemy, Neon Postgres in production, SQLite in development. It runs on Render's own Python runtime (no Docker).
+The API behind the Kannagi Night Mart website: accounts, catalog, orders, manual (in-person) sales, sales figures, offers, the spin wheel and the admin console. FastAPI + SQLAlchemy, Neon Postgres in production, SQLite in development. It runs on Render's own Python runtime (no Docker).
 
 ## How it's secured
 

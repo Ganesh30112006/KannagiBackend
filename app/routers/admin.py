@@ -8,16 +8,20 @@ from sqlalchemy.orm import Session, selectinload
 
 from .. import site, sync
 from ..database import get_db, takes_turns
-from ..models import Order, OrderItem, Product, Profile, User
+from ..models import ManualSale, ManualSaleItem, Order, OrderItem, Product, Profile, User
 from ..schemas import (
     AdminOrderOut,
     IdPath,
+    ManualSaleIn,
+    ManualSaleItemOut,
+    ManualSaleOut,
     PaymentIn,
     OrderCustomer,
     ProductCreate,
     ProductOut,
     ProductUpdate,
     Promotions,
+    SalesFigures,
     SalesSummary,
     SoldItem,
     StoreStatus,
@@ -25,7 +29,8 @@ from ..schemas import (
 )
 from ..security import shopkeeper
 from ..images import ImageStoreError, delete_image, store_image
-from ..services import get_settings, order_out, product_out, store_online
+from ..services import cart_summary, get_settings, order_out, paise, product_out, rupees, sale_price, store_online, to_ms
+from .orders import _take
 
 router = APIRouter(prefix="/admin", tags=["admin"], dependencies=[Depends(shopkeeper)])
 
@@ -165,27 +170,124 @@ def recent_orders(limit: int = Query(100, ge=1, le=500), db: Session = Depends(g
 
 @router.get("/summary", response_model=SalesSummary)
 def sales_summary(db: Session = Depends(get_db)) -> SalesSummary:
-    """Money figures leave out cancelled orders, and UPI orders whose payment isn't confirmed: that
-    money may never arrive."""
+    """Online orders and manual sales, separately and together. Money figures leave out cancelled orders,
+    UPI orders whose payment isn't confirmed (that money may never arrive) and undone manual sales."""
     counted = and_(Order.cancelled.is_(False), or_(Order.payment != "UPI", Order.payment_confirmed.is_(True)))
+    kept = ManualSale.cancelled.is_(False)
     order_count = db.scalar(select(func.count(Order.id))) or 0
-    revenue = db.scalar(select(func.coalesce(func.sum(Order.total), 0)).where(counted))
-    investment = db.scalar(
-        select(func.coalesce(func.sum(OrderItem.purchase_price * OrderItem.quantity), 0)).join(Order).where(counted)
-    )
-    sold = db.execute(
-        select(OrderItem.product_name, func.sum(OrderItem.quantity))
-        .join(Order)
-        .where(counted)
-        .group_by(OrderItem.product_name)
-        .order_by(func.sum(OrderItem.quantity).desc(), OrderItem.product_name)
-    )
+
+    def figures(sale, item, total, where) -> SalesFigures:
+        count, revenue = db.execute(select(func.count(sale.id), func.coalesce(func.sum(total), 0)).where(where)).one()
+        units, investment = db.execute(
+            select(func.coalesce(func.sum(item.quantity), 0), func.coalesce(func.sum(item.purchase_price * item.quantity), 0))
+            .join(sale)
+            .where(where)
+        ).one()
+        return SalesFigures(count=count, items=int(units), revenue=round(float(revenue), 2), investment=round(float(investment), 2))
+
+    online = figures(Order, OrderItem, Order.total, counted)
+    manual = figures(ManualSale, ManualSaleItem, ManualSale.total, kept)
+    sold: dict[str, int] = {}
+    for item, sale, where in ((OrderItem, Order, counted), (ManualSaleItem, ManualSale, kept)):
+        for name, qty in db.execute(select(item.product_name, func.sum(item.quantity)).join(sale).where(where).group_by(item.product_name)):
+            sold[name] = sold.get(name, 0) + int(qty)
     return SalesSummary(
         order_count=order_count,
-        revenue=round(float(revenue), 2),
-        investment=round(float(investment), 2),
-        sold=[SoldItem(name=name, qty=int(qty)) for name, qty in sold],
+        revenue=round(online.revenue + manual.revenue, 2),
+        investment=round(online.investment + manual.investment, 2),
+        sold=[SoldItem(name=name, qty=qty) for name, qty in sorted(sold.items(), key=lambda row: (-row[1], row[0]))],
+        online=online,
+        manual=manual,
     )
+
+
+# --- manual (in-person) sales ---
+
+MANUAL_SALES_SHOWN = 50
+
+
+def manual_sale_out(sale: ManualSale) -> ManualSaleOut:
+    return ManualSaleOut(
+        id=sale.id,
+        created_at=to_ms(sale.created_at),
+        items=[ManualSaleItemOut(name=item.product_name, qty=item.quantity, price=item.sale_price) for item in sale.items],
+        total=sale.total,
+        investment=round(sum(item.purchase_price * item.quantity for item in sale.items), 2),
+        payment=sale.payment,  # type: ignore[arg-type]
+        note=sale.note,
+        recorded_by=sale.recorded_by,
+        cancelled=sale.cancelled,
+    )
+
+
+@router.get("/manual-sales", response_model=list[ManualSaleOut], response_model_exclude_none=True)
+def recent_manual_sales(limit: int = Query(MANUAL_SALES_SHOWN, ge=1, le=200), db: Session = Depends(get_db)) -> list[ManualSaleOut]:
+    """Newest first, undone ones included (marked), so every entry stays accounted for."""
+    sales = db.scalars(select(ManualSale).options(selectinload(ManualSale.items)).order_by(ManualSale.id.desc()).limit(limit))
+    return [manual_sale_out(sale) for sale in sales]
+
+
+@router.post("/manual-sales", response_model=ManualSaleOut, response_model_exclude_none=True, status_code=status.HTTP_201_CREATED)
+@takes_turns
+def record_manual_sale(body: ManualSaleIn, user: User = Depends(shopkeeper), db: Session = Depends(get_db)) -> ManualSaleOut:
+    """A sale made in person: its items come off the stock (never below what's there) and it counts in
+    sales and profit. The amount is the shop's prices unless another amount was received."""
+    quantities: dict[int, int] = {}
+    for item in body.items:
+        quantities[item.product_id] = quantities.get(item.product_id, 0) + item.quantity
+    products = {p.id: p for p in db.scalars(select(Product).where(Product.id.in_(quantities), Product.active))}
+    if len(products) != len(quantities):
+        raise HTTPException(status.HTTP_409_CONFLICT, "An item in this sale is no longer in the shop. Refresh the page.")
+    # Stock is taken in product-number order, the lock order of every write (see orders.place_order).
+    for product_id in sorted(quantities):
+        if not _take(db, product_id, quantities[product_id]):
+            db.rollback()
+            product = db.get(Product, product_id)
+            left = product.stock if product is not None else 0
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                f"Only {left} {products[product_id].name} in stock. If there are more, correct the stock first.",
+            )
+    shop = site.values(db)
+    lines = [(products[product_id], qty) for product_id, qty in quantities.items()]
+    total = paise(body.amount) if body.amount is not None else cart_summary(lines, shop.markup).subtotal
+    sale = ManualSale(total=rupees(total), payment=body.payment, note=body.note or None, recorded_by=user.phone or user.email)
+    for product, qty in lines:
+        sale.items.append(
+            ManualSaleItem(
+                product_id=product.id,
+                product_name=product.name,
+                quantity=qty,
+                purchase_price=product.purchase_price,
+                sale_price=sale_price(product, shop.markup),
+            )
+        )
+    db.add(sale)
+    sync.bump(db, sync.ORDERS, sync.CATALOG)
+    db.commit()
+    return manual_sale_out(sale)
+
+
+@router.post("/manual-sales/{sale_id}/undo", response_model=ManualSaleOut, response_model_exclude_none=True)
+@takes_turns
+def undo_manual_sale(sale_id: IdPath, db: Session = Depends(get_db)) -> ManualSaleOut:
+    """A sale entered by mistake: its items go back on the shelf and it stops counting. Read under its
+    lock, so two undos at once put the stock back only once."""
+    sale = db.get(ManualSale, sale_id, options=[selectinload(ManualSale.items)], with_for_update=True)
+    if sale is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Sale not found.")
+    if sale.cancelled:
+        raise HTTPException(status.HTTP_409_CONFLICT, "This sale was already undone.")
+    back: dict[int, int] = {}
+    for item in sale.items:
+        if item.product_id is not None:
+            back[item.product_id] = back.get(item.product_id, 0) + item.quantity
+    for product_id in sorted(back):
+        db.execute(update(Product).where(Product.id == product_id).values(stock=Product.stock + back[product_id]))
+    sale.cancelled = True
+    sync.bump(db, sync.ORDERS, sync.CATALOG)
+    db.commit()
+    return manual_sale_out(sale)
 
 
 def _locked_order(db: Session, order_id: int) -> Order | None:

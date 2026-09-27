@@ -11,7 +11,7 @@ from ..database import get_db
 from ..models import User
 from ..security import current_user, has_shop_access
 from ..services import user_out
-from .admin import recent_orders, sales_summary
+from .admin import MANUAL_SALES_SHOWN, recent_manual_sales, recent_orders, sales_summary
 from .orders import my_orders
 from .profile import get_profile
 from .shop import list_products, list_wishes, promotions, store_status
@@ -92,6 +92,7 @@ def sync_changes(
         result["admin"] = {
             "orders": _json(recent_orders(limit=ADMIN_ORDERS, db=db), drop_none=True),
             "summary": _json(sales_summary(db)),
+            "manualSales": _json(recent_manual_sales(limit=MANUAL_SALES_SHOWN, db=db), drop_none=True),
         }
     return result
 

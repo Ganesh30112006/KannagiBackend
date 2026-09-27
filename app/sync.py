@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 from .models import SyncState
 
 CATALOG = "catalog"  # products, prices, stock
-ORDERS = "orders"  # any order placed or changed (payment, fulfilment)
+ORDERS = "orders"  # any order placed or changed (payment, fulfilment), and manual sales
 PROMOTIONS = "promotions"  # offers, spin wheel, launch message
 WISHES = "wishes"  # wishlist requests
 SITE = "site"  # shop details the site admin sets (UPI, contacts, hours, options, pricing)

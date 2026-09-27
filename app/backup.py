@@ -10,7 +10,7 @@ A backup holds every table, taken from one consistent snapshot, so each order al
 It is an ordinary SQLite database: open it with any SQLite viewer, or run the API on a copy of it
 (DATABASE_URL=sqlite:///path/to/copy.db) to look around.
 
---restore copies a backup into DATABASE_URL, but only while that database has no accounts or orders,
+--restore copies a backup into DATABASE_URL, but only while that database has no accounts, orders or sales,
 so it can never overwrite a live shop. To recover, make a new database (for example a new Neon branch),
 point DATABASE_URL at it, restore into it, then switch the shop over.
 """
@@ -64,14 +64,17 @@ def restore(backup_file: Path, target: Engine = engine) -> dict[str, int]:
         # A backup taken before a column or table existed still restores; those get their defaults.
         saved = inspect(reader)
         saved_columns = {name: {column["name"] for column in saved.get_columns(name)} for name in saved.get_table_names()}
-        # A first start makes the main admin (ADMIN_MOBILE), so admin accounts alone still count as empty.
+        # A first start makes the main admin (ADMIN_MOBILE), so admin accounts alone still count as empty
+        # (but not once an admin has entered manual sales).
         User = models.User.__table__
-        in_use = writer.scalar(select(func.count()).select_from(models.Order.__table__)) or writer.scalar(
-            select(func.count()).select_from(User).where(User.c.is_admin.is_(False))
+        in_use = (
+            writer.scalar(select(func.count()).select_from(models.Order.__table__))
+            or writer.scalar(select(func.count()).select_from(models.ManualSale.__table__))
+            or writer.scalar(select(func.count()).select_from(User).where(User.c.is_admin.is_(False)))
         )
         if in_use:
             raise SystemExit(
-                "This database already has customers, shopkeepers or orders, so nothing was restored. "
+                "This database already has customers, shopkeepers, orders or sales, so nothing was restored. "
                 "Restore into a new, empty database instead."
             )
         # Only default data (settings, the main admin) is here: replace it with the backup's. The next
