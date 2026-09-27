@@ -2,6 +2,7 @@
 
 import re
 from typing import Annotated, Literal
+from urllib.parse import parse_qs
 
 from fastapi import Path
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
@@ -36,6 +37,15 @@ def upi_reference(value: str) -> str:
 
 # A UPI ID (VPA): name@bank, e.g. 7032767115@ibl.
 UPI_ID_PATTERN = re.compile(r"[A-Za-z0-9._-]{2,64}@[A-Za-z][A-Za-z0-9.-]{1,63}")
+
+
+def upi_qr_payee(text: str) -> str | None:
+    """The UPI ID a UPI QR pays (upi://pay?pa=...&pn=...), or None when it isn't one."""
+    scheme, _, query = text.partition("?")
+    if scheme.lower() != "upi://pay" or any(c.isspace() for c in text):
+        return None
+    payee = (parse_qs(query).get("pa") or [""])[0]
+    return payee if UPI_ID_PATTERN.fullmatch(payee) else None
 
 
 def mobile_digits(value: str) -> str:
@@ -382,6 +392,9 @@ class SitePublic(Stripped):
 
     upi_id: str = Field(default="7032767115@ibl", max_length=130)
     upi_name: str = Field(default="Mavidi Rajendra Prasad", min_length=1, max_length=60)
+    # What the shop's own UPI QR says (upi://pay?pa=...), read from the QR image uploaded at /admin.
+    # Customers scan a QR with exactly this text. None: a QR made from upi_id and the amount instead.
+    upi_qr: str | None = Field(default=None, max_length=1000)
     shop_phone: str = Field(default="7032767115", max_length=20)
     help_phone: str = Field(default="9704535908", max_length=20)
     pickup_point: str = Field(default="Block B, Room 618", min_length=1, max_length=80)
@@ -402,6 +415,13 @@ class SitePublic(Stripped):
             raise ValueError("Enter a UPI ID like 7032767115@ibl.")
         return value
 
+    @field_validator("upi_qr")
+    @classmethod
+    def _upi_qr(cls, value: str | None) -> str | None:
+        if value and upi_qr_payee(value) is None:
+            raise ValueError("That isn't a UPI payment QR (it should start with upi://pay and name a UPI ID).")
+        return value or None
+
     @field_validator("shop_phone", "help_phone")
     @classmethod
     def _phone(cls, value: str) -> str:
@@ -409,6 +429,9 @@ class SitePublic(Stripped):
 
     @model_validator(mode="after")
     def _consistent(self):
+        payee = upi_qr_payee(self.upi_qr) if self.upi_qr else None
+        if payee and payee.lower() != self.upi_id.lower():
+            raise ValueError(f"The QR pays {payee} but the UPI ID is {self.upi_id}. Upload the QR for {self.upi_id}, or remove the QR.")
         if self.open_hour == self.close_hour:
             raise ValueError("Opening and closing hours must be different.")
         if not (self.upi_enabled or self.cash_enabled):
