@@ -56,6 +56,7 @@ ADDED_COLUMNS = {
         "mobile": "VARCHAR(20)",
         "is_admin": "BOOLEAN NOT NULL DEFAULT FALSE",
         "deleted_at": "TIMESTAMP",
+        "is_customer": "BOOLEAN NOT NULL DEFAULT FALSE",
     },
     "mart_settings": {"coupon_rule": "VARCHAR(10) NOT NULL DEFAULT 'best'"},
     "orders": {
@@ -105,6 +106,12 @@ def _upgrade(connection: Connection) -> list[str]:
         ))
     if "users.is_admin" in added:
         retire_shared_sign_ins(connection)
+    if "users.is_customer" in added:
+        mark_customers(connection)
+    if not any(index["name"] == "ix_users_mobile" for index in inspector.get_indexes("users")):
+        # Customers sign in with their mobile number.
+        connection.execute(text("CREATE INDEX ix_users_mobile ON users (mobile)"))
+        added.append("users.mobile (index)")
     email = next(column for column in inspector.get_columns("users") if column["name"] == "email")
     if not email["nullable"]:
         # Admin and shopkeeper accounts have no email. (SQLite's table is rebuilt after this transaction.)
@@ -112,6 +119,11 @@ def _upgrade(connection: Connection) -> list[str]:
             connection.execute(text("ALTER TABLE users ALTER COLUMN email DROP NOT NULL"))
         added.append("users.email (now optional)")
     return added
+
+
+def mark_customers(connection) -> None:
+    """Customer accounts from before the is_customer column: the ones with an email (staff have none)."""
+    connection.execute(text("UPDATE users SET is_customer = TRUE WHERE email IS NOT NULL"))
 
 
 def retire_shared_sign_ins(connection) -> None:

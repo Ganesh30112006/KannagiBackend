@@ -33,7 +33,9 @@ def save_profile(body: ProfileBody, user: User = Depends(current_user), db: Sess
     profile.block = body.block
     profile.room_number = body.room_number
     db.add(profile)
-    if user.email is not None:
-        user.mobile = body.phone  # her one mobile number: for delivery and for reaching her
+    if user.is_customer and user.mobile is None:
+        # An account from before sign-up asked for a number signs in with this one from now on. (Her
+        # sign-in number doesn't follow later changes here: this number may be a friend's.)
+        user.mobile = body.phone
     db.commit()
     return _out(profile)

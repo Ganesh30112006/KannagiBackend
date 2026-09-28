@@ -16,14 +16,16 @@ class User(Base):
     __tablename__ = "users"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
-    # Customers sign in with email and password. Admins and shopkeepers ("staff", made at /admin) sign
-    # in with a mobile number (`phone`) and a password; they have no email.
+    # Customers sign in with their mobile number (`mobile`) and a password. Customer accounts from before
+    # have an email too, no longer used. Admins and shopkeepers ("staff", made at /admin) sign in with a
+    # mobile number (`phone`) and a password.
     email: Mapped[str | None] = mapped_column(String(320), unique=True, index=True, nullable=True)
     phone: Mapped[str | None] = mapped_column(String(20), unique=True, index=True, nullable=True)
-    # A customer's own mobile number (+91XXXXXXXXXX), given at sign-up so the shop can reach her.
-    # Separate from `phone`, which is only a staff sign-in number.
-    mobile: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    # A customer's mobile number (+91XXXXXXXXXX): her sign-in, and how the shop reaches her. Separate
+    # from `phone`, which is only a staff sign-in number (one person may have both accounts).
+    mobile: Mapped[str | None] = mapped_column(String(20), index=True, nullable=True)
     password_hash: Mapped[str] = mapped_column(String(100))
+    is_customer: Mapped[bool] = mapped_column(Boolean, default=False)  # signed up on the website
     is_shopkeeper: Mapped[bool] = mapped_column(Boolean, default=False)
     is_admin: Mapped[bool] = mapped_column(Boolean, default=False)
     first_order_used: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -155,6 +157,25 @@ class ManualSaleItem(Base):
     sale_price: Mapped[float] = mapped_column(Float)  # the shop's price each when sold
 
     sale: Mapped[ManualSale] = relationship(back_populates="items")
+
+
+class StockEntry(Base):
+    """Stock added (new stock bought) or taken off by hand on the dashboard: a new item's starting stock,
+    − / + or a typed number, or deleting an item. The admin's Investment page adds these up. Sales,
+    cancelled orders and undone sales aren't entries: they aren't stock bought or thrown away. Quick
+    changes to one item by the same person are one entry (see routers/admin.py: _log_stock)."""
+
+    __tablename__ = "stock_entries"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    product_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    product_name: Mapped[str] = mapped_column(String(80))
+    change: Mapped[int] = mapped_column(Integer)  # units added (+) or taken off (−)
+    purchase_price: Mapped[float] = mapped_column(Float)  # MRP each at the time: what the stock cost
+    # Who changed it, as their sign-in number (text, so it stays readable after the account is gone).
+    recorded_by: Mapped[str | None] = mapped_column(String(320), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 
 class MartSettings(Base):

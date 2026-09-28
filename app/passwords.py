@@ -15,7 +15,7 @@ def hash_password(password: str) -> str:
     return bcrypt.hashpw(_prehash(password), bcrypt.gensalt()).decode()
 
 
-# Checked against when the email is unknown, so a wrong email takes as long as a wrong password.
+# Checked against when there's no such account, so an unknown number takes as long as a wrong password.
 DUMMY_HASH = bcrypt.hashpw(b"not-a-real-password", bcrypt.gensalt()).decode()
 
 

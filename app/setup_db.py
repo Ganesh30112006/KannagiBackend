@@ -18,7 +18,7 @@ def main() -> None:
     print(f"Database: {target}")
     print(f"Created tables: {', '.join(created) if created else 'none (all present)'}")
     if added:
-        print(f"Added columns: {', '.join(added)}")
+        print(f"Upgraded: {', '.join(added)}")
     print("Default offers are in place (no products: add them in the dashboard).")
 
 

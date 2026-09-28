@@ -245,7 +245,7 @@ def user_out(user: User) -> UserOut:
         email=user.email,
         phone=user.phone,
         mobile=user.mobile,
-        # What this sign-in opens (a shopkeeper account signed in as a customer can't exist: no email).
+        # What this sign-in opens (a shopkeeper account can't sign in as a customer: it isn't one).
         is_shopkeeper=has_shop_access(user),
         is_admin=is_site_admin(user),
         is_owner=is_site_admin(user) and is_owner(user),

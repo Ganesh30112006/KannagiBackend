@@ -84,8 +84,10 @@ jobs:
           expect 200 "$api/health"
           expect 404 "$api/auth/me" # without the internal key every other path is hidden
           expect 401 "${key[@]}" "$api/auth/me"
-          expect 422 "${key[@]}" -d '{"email":"ci@example.com","password":"password123"}' "$api/auth/signup" # mobile number required
-          expect 201 "${key[@]}" -d '{"email":"ci@example.com","password":"password123","mobile":"9123456789"}' "$api/auth/signup"
+          expect 422 "${key[@]}" -d '{"password":"password123"}' "$api/auth/signup" # mobile number required
+          expect 201 "${key[@]}" -d '{"mobile":"9123456789","password":"password123"}' "$api/auth/signup"
+          expect 409 "${key[@]}" -d '{"mobile":"+91 91234 56789","password":"password456"}' "$api/auth/signup" # one account per number
+          expect 200 "${key[@]}" -d '{"mobile":"09123456789","password":"password123"}' "$api/auth/login"
           # The main admin was made from ADMIN_MOBILE / ADMIN_PASSWORD at start-up.
           expect 200 "${key[@]}" -d "{\"phone\":\"$ADMIN_MOBILE\",\"password\":\"$ADMIN_PASSWORD\"}" "$api/auth/admin-login"
           kill "$server"

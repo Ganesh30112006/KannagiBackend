@@ -1,6 +1,6 @@
 # Kannagi Night Mart API
 
-The API behind the Kannagi Night Mart website: accounts, catalog, orders, manual (in-person) sales, sales figures, offers, the spin wheel and the admin console. FastAPI + SQLAlchemy, Neon Postgres in production, SQLite in development. It runs on Render's own Python runtime (no Docker).
+The API behind the Kannagi Night Mart website: accounts, catalog, orders, manual (in-person) sales, sales figures, a record of stock added and taken off (for the admin's Investment page: new stock bought and the value of the stock left), profit day by day and item by item (the admin's Profit page), offers, the spin wheel and the admin console. FastAPI + SQLAlchemy, Neon Postgres in production, SQLite in development. It runs on Render's own Python runtime (no Docker).
 
 ## How it's secured
 
@@ -41,7 +41,7 @@ Phone / browser ──▶ Website server ──(X-Internal-Key)──▶ this AP
 
 ## CI/CD
 
-GitHub Actions (`.github/workflows/ci.yml`) checks every push to `main` and every pull request: pyflakes, and the API built and started exactly as `render.yaml` says on a throwaway Postgres 18 (Neon's version), then asked a few questions (health says ok, other paths are hidden without the key, sign-up needs a mobile number, the main admin can sign in). CI needs no secrets and never touches Neon, Cloudinary or the live shop.
+GitHub Actions (`.github/workflows/ci.yml`) checks every push to `main` and every pull request: pyflakes, and the API built and started exactly as `render.yaml` says on a throwaway Postgres 18 (Neon's version), then asked a few questions (health says ok, other paths are hidden without the key, sign-up needs a mobile number and allows one account per number, a customer signs in with her mobile number, the main admin can sign in). CI needs no secrets and never touches Neon, Cloudinary or the live shop.
 
 `render.yaml` sets `autoDeployTrigger: checksPass`: Render deploys a commit only after all its checks pass, and a failed check leaves the last good version running. Render's health check must pass before a new version gets any traffic. To deploy without a new commit: the service → **Manual Deploy**.
 

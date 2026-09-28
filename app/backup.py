@@ -10,8 +10,8 @@ A backup holds every table, taken from one consistent snapshot, so each order al
 It is an ordinary SQLite database: open it with any SQLite viewer, or run the API on a copy of it
 (DATABASE_URL=sqlite:///path/to/copy.db) to look around.
 
---restore copies a backup into DATABASE_URL, but only while that database has no accounts, orders or sales,
-so it can never overwrite a live shop. To recover, make a new database (for example a new Neon branch),
+--restore copies a backup into DATABASE_URL, but only while that database has no accounts, orders, sales or
+stock changes, so it can never overwrite a live shop. To recover, make a new database (for example a new Neon branch),
 point DATABASE_URL at it, restore into it, then switch the shop over.
 """
 
@@ -25,7 +25,7 @@ from sqlalchemy import Engine, Integer, create_engine, func, insert, inspect, se
 
 from . import models
 from .config import BACKEND_DIR
-from .database import Base, engine, retire_shared_sign_ins, upgrade_schema
+from .database import Base, engine, mark_customers, retire_shared_sign_ins, upgrade_schema
 
 DEFAULT_DIR = BACKEND_DIR.parent / "backups"
 PREFIX = "kannagi-"
@@ -65,17 +65,18 @@ def restore(backup_file: Path, target: Engine = engine) -> dict[str, int]:
         saved = inspect(reader)
         saved_columns = {name: {column["name"] for column in saved.get_columns(name)} for name in saved.get_table_names()}
         # A first start makes the main admin (ADMIN_MOBILE), so admin accounts alone still count as empty
-        # (but not once an admin has entered manual sales).
+        # (but not once an admin has entered manual sales or stock).
         User = models.User.__table__
         in_use = (
             writer.scalar(select(func.count()).select_from(models.Order.__table__))
             or writer.scalar(select(func.count()).select_from(models.ManualSale.__table__))
+            or writer.scalar(select(func.count()).select_from(models.StockEntry.__table__))
             or writer.scalar(select(func.count()).select_from(User).where(User.c.is_admin.is_(False)))
         )
         if in_use:
             raise SystemExit(
-                "This database already has customers, shopkeepers, orders or sales, so nothing was restored. "
-                "Restore into a new, empty database instead."
+                "This database already has customers, shopkeepers, orders, sales or stock changes, so nothing was "
+                "restored. Restore into a new, empty database instead."
             )
         # Only default data (settings, the main admin) is here: replace it with the backup's. The next
         # start puts the main admin's password from ADMIN_PASSWORD back.
@@ -86,6 +87,8 @@ def restore(backup_file: Path, target: Engine = engine) -> dict[str, int]:
                 copied[table.name] = _copy_rows(reader, writer, table, saved_columns[table.name])
         if "is_admin" not in saved_columns.get("users", set()):
             retire_shared_sign_ins(writer)  # a backup from the shared admin password and PIN days
+        if "is_customer" not in saved_columns.get("users", set()):
+            mark_customers(writer)  # a backup from when customers signed in with an email
         if target.dialect.name == "postgresql":
             _reset_sequences(writer)
     return copied

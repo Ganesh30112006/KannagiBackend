@@ -1,14 +1,15 @@
 """Shopkeeper-only endpoints."""
 
 import re
+from datetime import timedelta
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Response, status
-from sqlalchemy import and_, case, func, or_, select, update
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.orm import Session, selectinload
 
 from .. import site, sync
 from ..database import get_db, takes_turns
-from ..models import ManualSale, ManualSaleItem, Order, OrderItem, Product, Profile, User
+from ..models import ManualSale, ManualSaleItem, Order, OrderItem, Product, Profile, StockEntry, User, utcnow
 from ..schemas import (
     AdminOrderOut,
     IdPath,
@@ -62,8 +63,9 @@ def _forget_image(db: Session, background: BackgroundTasks, url: str | None) -> 
         background.add_task(delete_image, url)
 
 
-def _get_product(db: Session, product_id: int) -> Product:
-    product = db.get(Product, product_id)
+def _get_product(db: Session, product_id: int, *, lock: bool = False) -> Product:
+    """lock: read it afresh and lock it until the commit, so changes to one item take turns."""
+    product = db.get(Product, product_id, with_for_update=True if lock else None, populate_existing=lock)
     if product is None or not product.active:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Product not found.")
     return product
@@ -71,9 +73,49 @@ def _get_product(db: Session, product_id: int) -> Product:
 
 # --- products ---
 
+MAX_STOCK = 100_000
+# Changes to one item by the same person this soon after their last one add up in one stock entry.
+STOCK_MERGE = timedelta(minutes=10)
+
+
+def _log_stock(db: Session, product: Product, change: int, user: User) -> None:
+    """Record stock added (bought) or taken off by hand, for the admin's Investment page. Changing the same
+    item again within a few minutes adds to the same entry, so taps on + count as one purchase and a typo
+    put right at once leaves nothing behind. Called with the item locked (or just made), so the entry
+    it adds to can't change under it."""
+    if not change:
+        return
+    by = user.phone or user.email
+    now = utcnow()
+    last = db.scalar(select(StockEntry).where(StockEntry.product_id == product.id).order_by(StockEntry.id.desc()).limit(1))
+    if (
+        last is not None
+        and last.recorded_by == by
+        and last.product_name == product.name
+        and last.purchase_price == product.purchase_price
+        and last.updated_at >= now - STOCK_MERGE
+    ):
+        last.change += change
+        last.updated_at = now
+        if last.change == 0:
+            db.delete(last)
+        return
+    db.add(
+        StockEntry(
+            product_id=product.id,
+            product_name=product.name,
+            change=change,
+            purchase_price=product.purchase_price,
+            recorded_by=by,
+            created_at=now,
+            updated_at=now,
+        )
+    )
+
 
 @router.post("/products", response_model=ProductOut, response_model_exclude_none=True, status_code=status.HTTP_201_CREATED)
-def create_product(body: ProductCreate, db: Session = Depends(get_db)) -> ProductOut:
+def create_product(body: ProductCreate, user: User = Depends(shopkeeper), db: Session = Depends(get_db)) -> ProductOut:
+    """Its starting stock counts as stock bought."""
     image_url = _save_image(body.image)
     product = Product(
         name=body.name,
@@ -85,6 +127,8 @@ def create_product(body: ProductCreate, db: Session = Depends(get_db)) -> Produc
         image_url=image_url,
     )
     db.add(product)
+    db.flush()
+    _log_stock(db, product, product.stock, user)
     sync.bump(db, sync.CATALOG)
     db.commit()
     return product_out(product)
@@ -92,14 +136,32 @@ def create_product(body: ProductCreate, db: Session = Depends(get_db)) -> Produc
 
 @router.patch("/products/{product_id}", response_model=ProductOut, response_model_exclude_none=True)
 def update_product(
-    product_id: IdPath, body: ProductUpdate, background: BackgroundTasks, db: Session = Depends(get_db)
+    product_id: IdPath,
+    body: ProductUpdate,
+    background: BackgroundTasks,
+    user: User = Depends(shopkeeper),
+    db: Session = Depends(get_db),
 ) -> ProductOut:
-    product = _get_product(db, product_id)
-    old_image = product.image_url
-    fields = body.model_fields_set
-    if "stock" in fields and body.stock_delta:
+    """Stock added counts as stock bought, and stock taken off as taken off (see _log_stock)."""
+    if "stock" in body.model_fields_set and body.stock_delta:
         # Setting and adjusting in one request is ambiguous; the website sends one or the other.
         raise HTTPException(422, "Send either stock or stockDelta, not both.")
+    _get_product(db, product_id)  # a missing item is refused before a photo is uploaded for it
+    # Uploaded before the item is locked: an upload can take seconds, and orders for it would wait.
+    image_url = _save_image(body.image) if "image" in body.model_fields_set else None
+    product, old_image = _apply_update(db, product_id, body, image_url, user)
+    if old_image != product.image_url:
+        _forget_image(db, background, old_image)
+    return product_out(product)
+
+
+@takes_turns
+def _apply_update(db: Session, product_id: int, body: ProductUpdate, image_url: str | None, user: User) -> tuple[Product, str | None]:
+    """With the item locked, so quick taps or two shopkeepers changing its stock at once each start from
+    the stock the one before left, and its stock entry adds up the same way."""
+    product = _get_product(db, product_id, lock=True)
+    old_image, old_stock = product.image_url, product.stock
+    fields = body.model_fields_set
     if "name" in fields and body.name:
         product.name = body.name
     if "mrp" in fields and body.mrp is not None:
@@ -107,29 +169,28 @@ def update_product(
     if "stock" in fields and body.stock is not None:
         product.stock = body.stock
     if body.stock_delta:
-        new_stock = Product.stock + body.stock_delta
-        db.execute(
-            update(Product).where(Product.id == product_id).values(stock=case((new_stock < 0, 0), else_=new_stock)),
-            execution_options={"synchronize_session": False},
-        )
-        db.flush()
-        db.refresh(product)
+        wanted = product.stock + body.stock_delta
+        if wanted > MAX_STOCK:
+            raise HTTPException(422, f"Stock can be at most {MAX_STOCK:,}.")
+        product.stock = max(wanted, 0)  # taking off more than there is leaves none
     if "threshold" in fields and body.threshold is not None:
         product.threshold = body.threshold
     if "image" in fields:
-        product.image_url = _save_image(body.image)
+        product.image_url = image_url
+    _log_stock(db, product, product.stock - old_stock, user)
     sync.bump(db, sync.CATALOG)
     db.commit()
-    if old_image != product.image_url:
-        _forget_image(db, background, old_image)
-    return product_out(product)
+    return product, old_image
 
 
 @router.delete("/products/{product_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_product(product_id: IdPath, background: BackgroundTasks, db: Session = Depends(get_db)) -> Response:
-    # Soft delete so past orders keep their history (orders store names, not photos).
-    product = _get_product(db, product_id)
+@takes_turns
+def delete_product(product_id: IdPath, background: BackgroundTasks, user: User = Depends(shopkeeper), db: Session = Depends(get_db)) -> Response:
+    # Soft delete so past orders keep their history (orders store names, not photos). Locked, so two
+    # deletes at once take its stock off only once.
+    product = _get_product(db, product_id, lock=True)
     product.active = False
+    _log_stock(db, product, -product.stock, user)  # its stock leaves the shop's stock
     sync.bump(db, sync.CATALOG)
     db.commit()
     _forget_image(db, background, product.image_url)
@@ -151,7 +212,8 @@ def _with_customers(db: Session, orders: list[Order]) -> list[AdminOrderOut]:
         saved = order.customer_phone is not None
         customer = OrderCustomer(
             name=order.customer_name if saved else (profile.full_name if profile else None),
-            phone=order.customer_phone if saved else (profile.phone if profile else None),
+            # No details saved anywhere: her sign-in number still reaches her.
+            phone=order.customer_phone if saved else (profile.phone if profile else (user.mobile if user else None)),
             block=order.customer_block if saved else (profile.block if profile else None),  # type: ignore[arg-type]
             room=order.customer_room if saved else (profile.room_number if profile else None),
             email=(user.email or user.phone) if user else None,

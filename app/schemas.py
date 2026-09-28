@@ -5,7 +5,7 @@ from typing import Annotated, Literal
 from urllib.parse import parse_qs
 
 from fastapi import Path
-from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic.alias_generators import to_camel
 
 CouponKind = Literal["free60", "three5", "freeSnack100", "halfDelivery", "four10", "premium5"]
@@ -15,6 +15,9 @@ Delivery = Literal["Pickup", "Room Delivery"]
 Payment = Literal["UPI", "Pay on Delivery"]
 ManualPayment = Literal["Cash", "UPI"]  # how an in-person sale was paid
 StoreOverride = Literal["auto", "online", "offline"]
+# The Investment and Profit pages' periods, in the shop's dates: today, the last 7 days, this month, last
+# month, all time.
+InvestmentPeriod = Literal["today", "week", "month", "last_month", "all"]
 # Which reward applies when a spin coupon and an automatic offer both could: the bigger saving, or always the coupon.
 CouponRule = Literal["best", "coupon"]
 
@@ -99,15 +102,10 @@ class Stripped(CamelModel):
 # --- auth ---
 
 
-class AuthIn(Stripped):
-    """Email is only the username: the shop never sends email."""
+class MobileIn(Stripped):
+    """A customer's mobile number: her username, and how the shop reaches her (it never sends messages
+    or codes by itself)."""
 
-    email: EmailStr
-    password: str = Field(min_length=8, max_length=128)
-
-
-class SignupIn(AuthIn):
-    # So the shop can reach her, e.g. with a new password if she forgets hers.
     mobile: str = Field(max_length=20)
 
     @field_validator("mobile")
@@ -116,11 +114,19 @@ class SignupIn(AuthIn):
         return indian_mobile(value)
 
 
+class LoginIn(MobileIn):
+    password: str = Field(min_length=1, max_length=128)
+
+
+class SignupIn(MobileIn):
+    password: str = Field(min_length=8, max_length=128)
+
+
 class UserOut(CamelModel):
     id: str
-    email: str | None = None
+    email: str | None = None  # an older customer account's email (no longer used)
     phone: str | None = None  # an admin's or shopkeeper's sign-in number
-    mobile: str | None = None  # a customer's mobile number
+    mobile: str | None = None  # a customer's mobile number: her sign-in
     is_shopkeeper: bool  # signed in to the dashboard (as a shopkeeper or an admin)
     is_admin: bool = False  # signed in to /admin
     is_owner: bool = False  # the main admin from the server settings (ADMIN_MOBILE)
@@ -130,10 +136,6 @@ class UserOut(CamelModel):
 class AuthOut(CamelModel):
     token: str
     user: UserOut
-
-
-class EmailIn(Stripped):
-    email: EmailStr
 
 
 class MessageOut(CamelModel):
@@ -293,6 +295,109 @@ class ManualSaleOut(CamelModel):
     note: str | None = None
     recorded_by: str | None = None
     cancelled: bool
+
+
+# --- investment (stock bought and stock left) ---
+
+
+class InvestmentItem(CamelModel):
+    name: str
+    emoji: str | None = None
+    qty: int
+    value: float  # at MRP, what the shop pays
+
+
+class StockEntryOut(CamelModel):
+    """Stock added or taken off by hand on the dashboard (quick changes by one person are one entry)."""
+
+    id: int
+    created_at: int  # epoch milliseconds
+    name: str
+    change: int  # units added (+) or taken off (−)
+    price: float  # MRP each at the time
+    recorded_by: str | None = None
+
+
+class StockLeft(CamelModel):
+    items: int  # different items in stock
+    units: int
+    value: float  # at MRP, what the shop paid
+    sale_value: float  # at the shop's prices (eggs at MRP each: their markup is per order)
+
+
+class Investment(CamelModel):
+    """New stock bought (and taken off) in a period, and the stock left now, valued at MRP."""
+
+    period: InvestmentPeriod
+    start: str | None = None  # the period's first day (the shop's date, YYYY-MM-DD); None: all time
+    end: str  # its last day
+    tracking_since: int | None = None  # when the first stock change was recorded (epoch ms); None: none yet
+    bought: float
+    bought_units: int
+    bought_items: list[InvestmentItem]  # per item, biggest value first
+    taken_off: float
+    taken_off_units: int
+    entries: list[StockEntryOut]  # newest first, at most the latest 200
+    entry_count: int  # every entry in the period
+    left: StockLeft
+    left_items: list[InvestmentItem]  # per item in stock, biggest value first
+
+
+# --- profit (the admin's Profit page) ---
+
+
+class ProfitFigures(CamelModel):
+    count: int  # sales: orders, manual sales, or both
+    items: int  # units sold
+    revenue: float  # money received
+    cost: float  # what the items sold cost (their MRP)
+    gifts: float  # free gifts given with orders, at their price
+    profit: float  # revenue - cost - gifts
+
+
+class ProfitDay(CamelModel):
+    day: str  # the shop's date (YYYY-MM-DD) the day starts on (see Profit.day_starts_at)
+    orders: int
+    manual_sales: int
+    revenue: float
+    cost: float
+    gifts: float
+    profit: float
+
+
+class ProfitItem(CamelModel):
+    name: str
+    emoji: str | None = None
+    qty: int  # units sold (or, for the stock left, in stock)
+    revenue: float  # at the shop's prices: what they sold for (or would sell for)
+    cost: float  # at MRP
+    profit: float
+
+
+class Profit(CamelModel):
+    """Profit in a period, day by day and item by item, and the profit still in the stock left. Orders count
+    once paid (UPI once its payment is confirmed); cancelled orders and undone manual sales don't count.
+    item_profit + delivery_fees - discounts + amount_changes - total.gifts = total.profit."""
+
+    period: InvestmentPeriod
+    start: str | None = None  # the period's first day (YYYY-MM-DD); None: all time
+    end: str  # its last day
+    # The hour (shop's time, 0-23) each day starts: halfway through the hours the shop is closed, so a
+    # night's sales after midnight count with that night. Negative: that hour the evening before.
+    day_starts_at: int
+    total: ProfitFigures
+    online: ProfitFigures
+    manual: ProfitFigures
+    days: list[ProfitDay]  # every day of the period (all time: from the first sale), newest first
+    items: list[ProfitItem]  # per item sold, at the shop's prices, most profit first
+    item_profit: float  # the items' profit together
+    delivery_fees: float  # room delivery fees paid
+    discounts: float  # offers, coupons and first-order discounts
+    amount_changes: float  # manual sales: amounts received other than the shop's prices (+ more, - less)
+    awaiting: int  # UPI orders in the period whose payment isn't confirmed yet (not counted)
+    awaiting_money: float
+    stock: StockLeft  # right now, whatever the period
+    stock_items: list[ProfitItem]  # per item in stock, most profit first
 
 
 class StoreStatus(CamelModel):
@@ -540,9 +645,10 @@ class StoredProfile(CamelModel):
 
 class AdminUserOut(CamelModel):
     id: str
-    email: str | None = None
-    phone: str | None = None
-    mobile: str | None = None
+    email: str | None = None  # an older customer account's email (no longer used)
+    phone: str | None = None  # staff sign-in number
+    mobile: str | None = None  # a customer's sign-in number
+    is_customer: bool
     is_shopkeeper: bool
     is_admin: bool
     is_owner: bool  # the main admin from the server settings: can't be removed, blocked or reset here
@@ -562,6 +668,7 @@ class AdminOverview(CamelModel):
     orders_today: int
     manual_sales_today: int
     revenue_today: float  # online orders (paid) and manual sales
+    stock_value: float  # the stock left, at MRP
     open_orders: int
     awaiting_payment: int
     store_online: bool

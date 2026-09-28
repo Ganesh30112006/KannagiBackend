@@ -87,7 +87,7 @@ def current_user(
         kind: SessionKind = "admin"
     elif role == "shopkeeper" and user.is_shopkeeper:
         kind = "shopkeeper"
-    elif role is None and user.email is not None:
+    elif role is None and user.is_customer:
         kind = "customer"
     else:
         # The role was taken away, or an admin/shopkeeper account without its own sign-in (for

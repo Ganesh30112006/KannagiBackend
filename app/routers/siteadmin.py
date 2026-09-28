@@ -1,12 +1,14 @@
 """The site admin's controls (/admin on the website): shop details, admins and shopkeepers (their
 accounts and passwords), customers (including new passwords for those who forgot theirs), deleting
-accounts, and every order. Products, offers and store status use the shopkeeper endpoints, which admins
-may also call.
+accounts, every order, investment (stock bought and the stock left) and profit (day by day and item by
+item). Products, offers and store status use the shopkeeper endpoints, which admins may also call.
 
 Anyone else gets 404 from these endpoints, the same as for a path that doesn't exist."""
 
+import re
 import secrets
-from datetime import datetime, time, timezone
+from dataclasses import dataclass
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
@@ -17,7 +19,20 @@ from sqlalchemy.orm import Session, selectinload
 from .. import site, sync
 from ..config import settings
 from ..database import get_db, takes_turns
-from ..models import ManualSale, Order, Product, Profile, ResetRequest, Spin, User, WishRequest, utcnow
+from ..models import (
+    ManualSale,
+    ManualSaleItem,
+    Order,
+    OrderItem,
+    Product,
+    Profile,
+    ResetRequest,
+    Spin,
+    StockEntry,
+    User,
+    WishRequest,
+    utcnow,
+)
 from ..schemas import (
     MAX_ID,
     AdminOrderOut,
@@ -27,15 +42,24 @@ from ..schemas import (
     AuthOut,
     BlockIn,
     IdPath,
+    Investment,
+    InvestmentItem,
+    InvestmentPeriod,
     NewPasswordIn,
     ProfileBody,
+    Profit,
+    ProfitDay,
+    ProfitFigures,
+    ProfitItem,
     SiteAdminOut,
     SiteValues,
     StaffIn,
+    StockEntryOut,
+    StockLeft,
     StoredProfile,
 )
 from ..security import create_token, hash_password, site_admin, verify_password
-from ..services import get_settings, shop_now, store_online, to_ms, user_out
+from ..services import get_settings, is_egg, paise, rupees, sale_price, shop_now, store_online, to_ms, user_out
 from ..staff import is_owner
 from .admin import _with_customers
 
@@ -59,12 +83,17 @@ def _conflict(message: str) -> HTTPException:
     return HTTPException(status.HTTP_409_CONFLICT, message)
 
 
+def _day_starts(day: date) -> datetime:
+    """When a shop day (SHOP_TIMEZONE) starts, as the database's naive UTC."""
+    return datetime.combine(day, time(), tzinfo=settings.tz).astimezone(timezone.utc).replace(tzinfo=None)
+
+
 # --- overview ---
 
 
 @router.get("/overview", response_model=AdminOverview)
 def overview(db: Session = Depends(get_db)) -> AdminOverview:
-    midnight = datetime.combine(shop_now().date(), time(), tzinfo=settings.tz).astimezone(timezone.utc).replace(tzinfo=None)
+    midnight = _day_starts(shop_now().date())
     live = Order.cancelled.is_(False)
     paid = or_(Order.payment != "UPI", Order.payment_confirmed.is_(True))
     manual_today = and_(ManualSale.cancelled.is_(False), ManualSale.created_at >= midnight)
@@ -76,17 +105,351 @@ def overview(db: Session = Depends(get_db)) -> AdminOverview:
         return db.scalar(select(func.count()).select_from(User).where(ACTIVE, *where)) or 0
 
     return AdminOverview(
-        customers=people(User.email.is_not(None)),
+        customers=people(User.is_customer.is_(True)),
         shopkeepers=people(User.is_shopkeeper.is_(True)),
         admins=people(User.is_admin.is_(True)),
         blocked=people(User.blocked.is_(True)),
         orders_today=db.scalar(select(func.count()).where(live, Order.created_at >= midnight)) or 0,
         manual_sales_today=db.scalar(select(func.count(ManualSale.id)).where(manual_today)) or 0,
         revenue_today=round(online_today + manual_money_today, 2),
+        stock_value=round(float(db.scalar(select(func.coalesce(func.sum(Product.purchase_price * Product.stock), 0)).where(Product.active)) or 0), 2),
         open_orders=db.scalar(select(func.count()).where(live, Order.fulfilled.is_(False))) or 0,
         awaiting_payment=db.scalar(select(func.count()).where(live, Order.payment == "UPI", Order.payment_confirmed.is_(False))) or 0,
         store_online=store_online(get_settings(db), shop.open_hour, shop.close_hour),
         reset_requests=db.scalar(select(func.count(ResetRequest.id))) or 0,
+    )
+
+
+# --- investment ---
+
+STOCK_ENTRIES_SHOWN = 200
+
+
+def _period_days(period: InvestmentPeriod, today: date | None = None) -> tuple[date | None, date]:
+    """The period's first and last day (the shop's dates, up to today); no first day for all time."""
+    today = today or shop_now().date()
+    if period == "today":
+        return today, today
+    if period == "week":
+        return today - timedelta(days=6), today
+    if period == "month":
+        return today.replace(day=1), today
+    if period == "last_month":
+        last = today.replace(day=1) - timedelta(days=1)
+        return last.replace(day=1), last
+    return None, today
+
+
+@router.get("/investment", response_model=Investment, response_model_exclude_none=True)
+def investment(period: InvestmentPeriod = "month", db: Session = Depends(get_db)) -> Investment:
+    """What went into stock, at MRP (what the shop pays): new stock bought in the period (stock added by
+    hand on the dashboard, new items' starting stock included) and stock taken off by hand (corrections,
+    deleted items), from the stock record; and the stock left right now, from the items on sale."""
+    first, last = _period_days(period)
+    when = [StockEntry.created_at < _day_starts(last + timedelta(days=1))]
+    if first is not None:
+        when.append(StockEntry.created_at >= _day_starts(first))
+    value = StockEntry.change * StockEntry.purchase_price
+
+    def moved(which) -> tuple[int, float]:
+        units, money = db.execute(
+            select(func.coalesce(func.sum(StockEntry.change), 0), func.coalesce(func.sum(value), 0)).where(*when, which)
+        ).one()
+        return abs(int(units)), round(abs(float(money)), 2)
+
+    bought_units, bought = moved(StockEntry.change > 0)
+    taken_off_units, taken_off = moved(StockEntry.change < 0)
+    per_item = db.execute(
+        select(StockEntry.product_name, func.sum(StockEntry.change), func.sum(value))
+        .where(*when, StockEntry.change > 0)
+        .group_by(StockEntry.product_name)
+    )
+    bought_items = sorted(
+        (InvestmentItem(name=name, qty=int(units), value=round(float(money), 2)) for name, units, money in per_item),
+        key=lambda item: (-item.value, item.name),
+    )
+    entries = db.scalars(
+        select(StockEntry).where(*when).order_by(StockEntry.created_at.desc(), StockEntry.id.desc()).limit(STOCK_ENTRIES_SHOWN)
+    )
+    since = db.scalar(select(func.min(StockEntry.created_at)))
+
+    markup = site.values(db).markup
+    in_stock = list(db.scalars(select(Product).where(Product.active, Product.stock > 0)))
+    left_items = sorted(
+        (
+            InvestmentItem(name=product.name, emoji=product.emoji, qty=product.stock, value=rupees(paise(product.purchase_price) * product.stock))
+            for product in in_stock
+        ),
+        key=lambda item: (-item.value, item.name),
+    )
+    return Investment(
+        period=period,
+        start=first.isoformat() if first else None,
+        end=last.isoformat(),
+        tracking_since=to_ms(since) if since else None,
+        bought=bought,
+        bought_units=bought_units,
+        bought_items=bought_items,
+        taken_off=taken_off,
+        taken_off_units=taken_off_units,
+        entries=[
+            StockEntryOut(
+                id=entry.id,
+                created_at=to_ms(entry.created_at),
+                name=entry.product_name,
+                change=entry.change,
+                price=entry.purchase_price,
+                recorded_by=entry.recorded_by,
+            )
+            for entry in entries
+        ],
+        entry_count=db.scalar(select(func.count(StockEntry.id)).where(*when)) or 0,
+        left=StockLeft(
+            items=len(in_stock),
+            units=sum(product.stock for product in in_stock),
+            value=rupees(sum(paise(product.purchase_price) * product.stock for product in in_stock)),
+            sale_value=rupees(sum(paise(sale_price(product, markup)) * product.stock for product in in_stock)),
+        ),
+        left_items=left_items,
+    )
+
+
+# --- profit ---
+
+GIFT_PRICE = re.compile(r"₹(\d+(?:\.\d+)?)")  # "₹5 chocolate (free)", "₹10 free snack"
+Line = tuple[str, int, int, int]  # an item sold: name, units, MRP each and price each (paise)
+
+
+def _day_starts_at(open_hour: int, close_hour: int) -> int:
+    """The hour (shop's time) a day starts for daily profit: halfway through the hours the shop is closed,
+    so one night's sales (11 PM to 1 AM: noon to noon) are one day, named after the date the shop opened
+    on. Negative: that hour the evening before, for a shop that opens after midnight."""
+    closed = (open_hour - close_hour) % 24
+    hour = (close_hour + closed // 2) % 24
+    return hour if open_hour >= hour else hour - 24
+
+
+def _shop_day_starts(day: date, starts_at: int) -> datetime:
+    """When that day starts, as the database's naive UTC."""
+    local = datetime.combine(day, time(), tzinfo=settings.tz) + timedelta(hours=starts_at)
+    return local.astimezone(timezone.utc).replace(tzinfo=None)
+
+
+def _shop_day(moment: datetime, starts_at: int) -> date:
+    """The day a (naive UTC) moment counts in."""
+    local = moment.replace(tzinfo=timezone.utc).astimezone(settings.tz).replace(tzinfo=None)
+    return (local - timedelta(hours=starts_at)).date()
+
+
+@dataclass
+class _Tally:
+    """Sales added up, in paise."""
+
+    count: int = 0
+    units: int = 0
+    revenue: int = 0
+    cost: int = 0
+    gifts: int = 0
+
+    def add(self, revenue: int, cost: int, units: int, gifts: int = 0) -> None:
+        self.count += 1
+        self.units += units
+        self.revenue += revenue
+        self.cost += cost
+        self.gifts += gifts
+
+    @property
+    def profit(self) -> int:
+        return self.revenue - self.cost - self.gifts
+
+    def figures(self) -> ProfitFigures:
+        return ProfitFigures(
+            count=self.count,
+            items=self.units,
+            revenue=rupees(self.revenue),
+            cost=rupees(self.cost),
+            gifts=rupees(self.gifts),
+            profit=rupees(self.profit),
+        )
+
+
+def _sales(db: Session, columns: list, item, link, where) -> list[tuple[tuple, list[Line]]]:
+    """Each sale's columns (its id first) and its items, read in one query, so an order cancelled at this
+    moment is either counted whole or not at all."""
+    rows = db.execute(
+        select(*columns, item.product_name, item.quantity, item.purchase_price, item.sale_price)
+        .outerjoin(item, link)
+        .where(where)
+        .order_by(columns[0], item.id)
+    )
+    sales: dict[int, tuple[tuple, list[Line]]] = {}
+    for row in rows:
+        *head, name, qty, cost, price = row
+        lines = sales.setdefault(head[0], (tuple(head), []))[1]
+        if name is not None:
+            lines.append((name, qty, paise(cost), paise(price)))
+    return list(sales.values())
+
+
+@router.get("/profit", response_model=Profit, response_model_exclude_none=True)
+def profit(period: InvestmentPeriod = "month", db: Session = Depends(get_db)) -> Profit:
+    """Profit is the money received minus what the items sold cost (their MRP) and the free gifts given
+    with orders. Day by day (each day runs from _day_starts_at, so a night stays whole), and item by item
+    at the shop's prices, with delivery fees, discounts and changed manual amounts beside them so it all
+    adds up; and the profit the stock left would make at the shop's prices."""
+    shop = site.values(db)
+    starts_at = _day_starts_at(shop.open_hour, shop.close_hour)
+    first, last = _period_days(period, _shop_day(utcnow(), starts_at))
+
+    def within(column) -> list:
+        when = [column < _shop_day_starts(last + timedelta(days=1), starts_at)]
+        if first is not None:
+            when.append(column >= _shop_day_starts(first, starts_at))
+        return when
+
+    # Counted as in the dashboard's Summary: UPI orders once their payment is confirmed; not cancelled
+    # orders or undone manual sales.
+    counted = and_(Order.cancelled.is_(False), or_(Order.payment != "UPI", Order.payment_confirmed.is_(True)), *within(Order.created_at))
+    kept = and_(ManualSale.cancelled.is_(False), *within(ManualSale.created_at))
+    orders = _sales(db, [Order.id, Order.created_at, Order.total, Order.discount, Order.freebies], OrderItem, OrderItem.order_id == Order.id, counted)
+    manual_sales = _sales(db, [ManualSale.id, ManualSale.created_at, ManualSale.total], ManualSaleItem, ManualSaleItem.sale_id == ManualSale.id, kept)
+
+    # Items by name now (on sale first, then the newest): emojis, and what a free pick cost.
+    picks = {
+        gift.removesuffix(FREE_PICK_SUFFIX)
+        for (*_, freebies), _ in orders
+        for gift in freebies or []
+        if isinstance(gift, str) and gift.endswith(FREE_PICK_SUFFIX)
+    }
+    names = {name for _, lines in (*orders, *manual_sales) for name, *_ in lines} | picks
+    catalog = {
+        product.name: product
+        for product in db.scalars(select(Product).where(Product.name.in_(names)).order_by(Product.active, Product.id))
+    } if names else {}
+
+    def gifts_cost(freebies) -> int:
+        """At the price of the gift: a free pick at its item's MRP; "₹5 chocolate (free)" at ₹5."""
+        cost = 0
+        for gift in freebies or []:
+            if not isinstance(gift, str):
+                continue
+            picked = catalog.get(gift.removesuffix(FREE_PICK_SUFFIX)) if gift.endswith(FREE_PICK_SUFFIX) else None
+            if picked is not None:
+                cost += paise(picked.purchase_price)
+            elif found := GIFT_PRICE.search(gift):
+                cost += paise(float(found.group(1)))
+        return cost
+
+    per_item: dict[str, list[int]] = {}  # name -> [units, at the shop's prices, cost]
+
+    def items_value(lines: list[Line]) -> tuple[int, int, int]:
+        """A sale's items at the shop's prices, what they cost and how many, also added to per_item. Eggs
+        are MRP each plus the markup once; the markup is what its other items show (price - MRP), or
+        today's for a sale of eggs alone."""
+        markup = next((price - cost for name, _, cost, price in lines if not is_egg(name)), shop.markup * 100)
+        value = cost_total = units = 0
+        for name, qty, cost, price in lines:
+            line_value = price * qty + (markup if is_egg(name) and qty > 0 else 0)
+            item = per_item.setdefault(name, [0, 0, 0])
+            item[0] += qty
+            item[1] += line_value
+            item[2] += cost * qty
+            value, cost_total, units = value + line_value, cost_total + cost * qty, units + qty
+        return value, cost_total, units
+
+    online, manual = _Tally(), _Tally()
+    days: dict[date, tuple[_Tally, _Tally]] = {}
+    fees = discounts = changes = 0
+    for (_, created_at, total, discount, freebies), lines in orders:
+        value, cost, units = items_value(lines)
+        received, off, gifts = paise(total), paise(discount), gifts_cost(freebies)
+        fees += received + off - value  # total = items + delivery fee - discount
+        discounts += off
+        online.add(received, cost, units, gifts)
+        days.setdefault(_shop_day(created_at, starts_at), (_Tally(), _Tally()))[0].add(received, cost, units, gifts)
+    for (_, created_at, total), lines in manual_sales:
+        value, cost, units = items_value(lines)
+        received = paise(total)
+        changes += received - value
+        manual.add(received, cost, units)
+        days.setdefault(_shop_day(created_at, starts_at), (_Tally(), _Tally()))[1].add(received, cost, units)
+
+    together = _Tally(
+        count=online.count + manual.count,
+        units=online.units + manual.units,
+        revenue=online.revenue + manual.revenue,
+        cost=online.cost + manual.cost,
+        gifts=online.gifts,
+    )
+    day_rows = []
+    day = last
+    while day >= (first or min(days, default=last)):
+        day_online, day_manual = days.get(day, (_Tally(), _Tally()))
+        day_rows.append(
+            ProfitDay(
+                day=day.isoformat(),
+                orders=day_online.count,
+                manual_sales=day_manual.count,
+                revenue=rupees(day_online.revenue + day_manual.revenue),
+                cost=rupees(day_online.cost + day_manual.cost),
+                gifts=rupees(day_online.gifts),
+                profit=rupees(day_online.profit + day_manual.profit),
+            )
+        )
+        day -= timedelta(days=1)
+
+    def item_out(name: str, qty: int, value: int, cost: int) -> ProfitItem:
+        product = catalog.get(name)
+        return ProfitItem(
+            name=name,
+            emoji=product.emoji if product else None,
+            qty=qty,
+            revenue=rupees(value),
+            cost=rupees(cost),
+            profit=rupees(value - cost),
+        )
+
+    sold = sorted((item_out(name, *figures) for name, figures in per_item.items()), key=lambda item: (-item.profit, item.name))
+    in_stock = list(db.scalars(select(Product).where(Product.active, Product.stock > 0)))
+    left = [
+        (product, paise(sale_price(product, shop.markup)) * product.stock, paise(product.purchase_price) * product.stock)
+        for product in in_stock
+    ]
+    stock_items = sorted(
+        (
+            ProfitItem(name=product.name, emoji=product.emoji, qty=product.stock, revenue=rupees(value), cost=rupees(cost), profit=rupees(value - cost))
+            for product, value, cost in left
+        ),
+        key=lambda item: (-item.profit, item.name),
+    )
+    waiting, waiting_money = db.execute(
+        select(func.count(Order.id), func.coalesce(func.sum(Order.total), 0)).where(
+            Order.cancelled.is_(False), Order.payment == "UPI", Order.payment_confirmed.is_(False), *within(Order.created_at)
+        )
+    ).one()
+    return Profit(
+        period=period,
+        start=first.isoformat() if first else None,
+        end=last.isoformat(),
+        day_starts_at=starts_at,
+        total=together.figures(),
+        online=online.figures(),
+        manual=manual.figures(),
+        days=day_rows,
+        items=sold,
+        item_profit=rupees(sum(value - cost for _, value, cost in per_item.values())),
+        delivery_fees=rupees(fees),
+        discounts=rupees(discounts),
+        amount_changes=rupees(changes),
+        awaiting=waiting,
+        awaiting_money=rupees(paise(float(waiting_money))),
+        stock=StockLeft(
+            items=len(in_stock),
+            units=sum(product.stock for product in in_stock),
+            value=rupees(sum(cost for *_, cost in left)),
+            sale_value=rupees(sum(value for _, value, _ in left)),
+        ),
+        stock_items=stock_items,
     )
 
 
@@ -144,7 +507,7 @@ def _user_rows(db: Session, user_ids: list[str] | None = None, *, role: Role = "
     if user_ids is not None:
         statement = statement.where(User.id.in_(user_ids))
     if role == "customers":
-        statement = statement.where(User.email.is_not(None))
+        statement = statement.where(User.is_customer.is_(True))
     elif role == "shopkeepers":
         statement = statement.where(User.is_shopkeeper.is_(True))
     elif role == "admins":
@@ -169,6 +532,7 @@ def _user_rows(db: Session, user_ids: list[str] | None = None, *, role: Role = "
             email=user.email,
             phone=user.phone,
             mobile=user.mobile,
+            is_customer=user.is_customer,
             is_shopkeeper=user.is_shopkeeper,
             is_admin=user.is_admin,
             is_owner=is_owner(user),
@@ -207,7 +571,7 @@ def list_users(
     db: Session = Depends(get_db),
 ) -> list[AdminUserOut]:
     """Newest first (role=resets: who asked for a new password, oldest request first).
-    q matches email, name, mobile number or room."""
+    q matches name, mobile number or room (or an older account's email)."""
     return _user_rows(db, role=role, query=q.strip(), limit=limit)
 
 
@@ -285,8 +649,8 @@ def edit_profile(user_id: str, body: ProfileBody, db: Session = Depends(get_db))
     profile = db.get(Profile, user.id) or Profile(user_id=user.id)
     profile.full_name, profile.phone, profile.block, profile.room_number = body.full_name, body.phone, body.block, body.room_number
     db.add(profile)
-    if user.email is not None:
-        user.mobile = body.phone  # her one mobile number: for delivery and for reaching her
+    if user.is_customer and user.mobile is None:
+        user.mobile = body.phone  # an account from before sign-up asked for a number signs in with this one
     db.commit()
     return _one(db, user)
 
@@ -319,7 +683,7 @@ def delete_user(user_id: str, db: Session = Depends(get_db), admin: User = Depen
         db.delete(user)
     else:
         user.email = user.phone = user.mobile = None
-        user.is_admin = user.is_shopkeeper = user.blocked = False
+        user.is_admin = user.is_shopkeeper = user.is_customer = user.blocked = False
         user.password_hash = hash_password(secrets.token_urlsafe(32))
         user.deleted_at = utcnow()
         _sign_out(user)
@@ -374,7 +738,7 @@ def all_orders(
         if digits and int(digits) <= MAX_ID:  # a mobile number is too big to be an order number
             conditions.append(Order.id == int(digits))
         if len(digits) >= 3:
-            conditions += [Order.customer_phone.like(f"%{digits}%"), User.phone.like(f"%{digits}%")]
+            conditions += [Order.customer_phone.like(f"%{digits}%"), User.phone.like(f"%{digits}%"), User.mobile.like(f"%{digits}%")]
         statement = statement.where(or_(*conditions))
     orders = list(db.scalars(statement.order_by(Order.id.desc()).limit(limit)))
     return _with_customers(db, orders)
