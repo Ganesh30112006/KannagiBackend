@@ -96,6 +96,8 @@ def current_user(
     if user.blocked:
         raise _unauthorized(BLOCKED)
     user.session_kind = kind  # type: ignore[attr-defined]
+    # When this sign-in runs out (naive UTC, like the database): order alerts on this device stop then.
+    user.session_expires_at = datetime.fromtimestamp(payload["exp"], timezone.utc).replace(tzinfo=None)  # type: ignore[attr-defined]
     return user
 
 

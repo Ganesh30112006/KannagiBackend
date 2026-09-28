@@ -1,8 +1,8 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session, selectinload
 
-from .. import site, sync
+from .. import alerts, site, sync
 from ..database import get_db, takes_turns
 from ..models import Order, OrderItem, Product, Profile, Spin, User, utcnow
 from ..schemas import IdPath, OrderIn, OrderOut, UtrIn
@@ -21,8 +21,6 @@ from ..services import (
 )
 
 router = APIRouter(prefix="/orders", tags=["orders"])
-
-FREE_PICK_MAX_PRICE = 12
 
 
 def _conflict(message: str) -> HTTPException:
@@ -46,13 +44,13 @@ def _check_utr_unused(db: Session, utr: str, order_id: int | None = None) -> Non
         )
 
 
-def _free_pick(db: Session, choice: str | None) -> Product | None:
-    """The free ₹10 item she picked, if it's on sale and in stock (a generic one is given otherwise)."""
+def _free_pick(db: Session, choice: str | None, up_to: int) -> Product | None:
+    """The free item she picked (MRP up to ₹up_to), if it's on sale and in stock (a generic one is given otherwise)."""
     if not choice:
         return None
     return db.scalar(
         select(Product)
-        .where(Product.name == choice, Product.active, Product.stock >= 1, Product.purchase_price <= FREE_PICK_MAX_PRICE)
+        .where(Product.name == choice, Product.active, Product.stock >= 1, Product.purchase_price <= up_to)
         .order_by(Product.id)
         .limit(1)
     )
@@ -76,7 +74,7 @@ def my_orders(user: User = Depends(current_user), db: Session = Depends(get_db))
 
 @router.post("", response_model=OrderOut, response_model_exclude_none=True, status_code=status.HTTP_201_CREATED)
 @takes_turns
-def place_order(body: OrderIn, user: User = Depends(current_user), db: Session = Depends(get_db)) -> OrderOut:
+def place_order(body: OrderIn, background: BackgroundTasks, user: User = Depends(current_user), db: Session = Depends(get_db)) -> OrderOut:
     # Every write takes its locks in one order: the customer, then the order, then products (by
     # number), then spin coupons, then the sync counters. Waiting only in that direction, two writes
     # can never deadlock. Locking her first also makes her own simultaneous orders take turns, and an
@@ -170,7 +168,7 @@ def place_order(body: OrderIn, user: User = Depends(current_user), db: Session =
         customer_room=contact[3],
     )
     # Stock is taken in product-number order (the lock order above), the free pick included.
-    free_pick = _free_pick(db, body.free_pick) if deal.free_pick else None
+    free_pick = _free_pick(db, body.free_pick, deal.pick_up_to) if deal.free_pick else None
     given = None
     for product_id in sorted({*quantities, *([free_pick.id] if free_pick else [])}):
         if product_id in quantities and not _take(db, product_id, quantities[product_id]):
@@ -189,7 +187,8 @@ def place_order(body: OrderIn, user: User = Depends(current_user), db: Session =
             )
         )
     if deal.free_pick:
-        order.freebies.append(f"{given} (free ₹10 pick)" if given else "₹10 free snack")
+        # The admin's Profit page and cancelling read these (siteadmin.picked_item).
+        order.freebies.append(f"{given} (free ₹{deal.pick_value} pick)" if given else f"₹{deal.pick_value} free snack")
     # Conditional updates: two orders sent at the same moment can't both use one coupon or the
     # first-order discount.
     if deal.coupon:
@@ -208,6 +207,8 @@ def place_order(body: OrderIn, user: User = Depends(current_user), db: Session =
     db.add(order)
     sync.bump(db, sync.ORDERS, sync.CATALOG)
     db.commit()
+    # The shopkeepers' phones and laptops with order alerts on get one, after the order is saved.
+    background.add_task(alerts.new_order, order.id)
     return order_out(order)
 
 

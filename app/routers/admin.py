@@ -422,7 +422,7 @@ def save_promotions(body: Promotions, db: Session = Depends(get_db)) -> Promotio
 
     row = get_settings(db)
     row.launch_message = body.launch_message.strip()
-    row.daily_offers = [offer.model_dump(by_alias=True) for offer in body.daily_offers]
+    row.daily_offers = [offer.model_dump(by_alias=True, exclude_none=True) for offer in body.daily_offers]
     row.wheel_prizes = [prize.model_dump(by_alias=True) for prize in body.wheel_prizes]
     row.coupon_rule = body.coupon_rule
     sync.bump(db, sync.PROMOTIONS)

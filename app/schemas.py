@@ -8,6 +8,8 @@ from fastapi import Path
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic.alias_generators import to_camel
 
+from . import webpush
+
 CouponKind = Literal["free60", "three5", "freeSnack100", "halfDelivery", "four10", "premium5"]
 OfferId = Literal["tier50", "tier100", "first", "bulk"]
 Block = Literal["A", "B", "C"]
@@ -214,11 +216,18 @@ class ProductUpdate(Stripped):
 
 
 class DailyOffer(CamelModel):
+    """An offer card: its text (what customers read) and what checkout gives (see services.best_deal).
+    The amounts the shop set apply; one that isn't set works as it always has (in brackets)."""
+
     id: OfferId
     title: str = Field(max_length=80)
     note: str = Field(max_length=200)
     icon: str = Field(max_length=16)
     active: bool
+    percent: int | None = Field(default=None, ge=0, le=100)  # % off: first order (10), cart over ₹200 (20)
+    free_delivery: bool | None = None  # cart over ₹200: no room delivery fee (no)
+    gift: int | None = Field(default=None, ge=0, le=1000)  # a free chocolate worth ₹: ₹50+ (5), cart over ₹200 (none)
+    pick_up_to: int | None = Field(default=None, ge=1, le=1000)  # ₹100+: a free item she picks, MRP up to ₹ (₹10 item)
 
 
 class WheelPrize(CamelModel):
@@ -533,6 +542,46 @@ class OrderCustomer(CamelModel):
 
 class AdminOrderOut(OrderOut):
     customer: OrderCustomer
+
+
+# --- order alerts (a notification for each new order; see webpush.py) ---
+
+
+class AlertKeyOut(CamelModel):
+    public_key: str | None  # what the browser subscribes with; None: alerts aren't set up on the server
+
+
+class AlertKeys(Stripped):
+    p256dh: str = Field(max_length=200)
+    auth: str = Field(max_length=100)
+
+
+class AlertDeviceIn(Stripped):
+    """A browser's push subscription (PushSubscription.toJSON(): endpoint and keys)."""
+
+    endpoint: str = Field(max_length=webpush.MAX_ENDPOINT_LENGTH)
+    keys: AlertKeys
+
+    @field_validator("endpoint")
+    @classmethod
+    def _endpoint(cls, value: str) -> str:
+        return webpush.check_endpoint(value)
+
+    @model_validator(mode="after")
+    def _keys(self) -> "AlertDeviceIn":
+        self.keys.p256dh, self.keys.auth = webpush.check_keys(self.keys.p256dh, self.keys.auth)
+        return self
+
+
+class AlertEndpointIn(Stripped):
+    """Which device: its push address."""
+
+    endpoint: str = Field(min_length=1, max_length=webpush.MAX_ENDPOINT_LENGTH)
+
+
+class AlertTestOut(CamelModel):
+    sent: bool
+    detail: str | None = None  # why it wasn't sent
 
 
 # --- site admin (/admin) ---

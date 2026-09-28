@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import JSON, BigInteger, Boolean, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .database import Base
@@ -242,6 +242,28 @@ class SyncState(Base):
 
     topic: Mapped[str] = mapped_column(String(20), primary_key=True)
     rev: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class AlertDevice(Base):
+    """A phone or laptop browser where a shopkeeper or admin turned on order alerts: its push address and
+    keys (see webpush.py), and the sign-in it belongs to. Alerts go there only while that sign-in lasts: not
+    after it runs out, the password is changed ("sign out everywhere" too), or the account loses its role,
+    is blocked or deleted. Signing out on the device removes it."""
+
+    __tablename__ = "alert_devices"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    endpoint: Mapped[str] = mapped_column(String(1000), unique=True)
+    p256dh: Mapped[str] = mapped_column(String(100))
+    auth: Mapped[str] = mapped_column(String(50))
+    role: Mapped[str] = mapped_column(String(20))  # the sign-in's: shopkeeper or admin
+    # The sign-in's password version (security._password_version) and when it runs out.
+    password_version: Mapped[int] = mapped_column(BigInteger)
+    session_expires_at: Mapped[datetime] = mapped_column(DateTime)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    # Each time the dashboard opens on the device it's refreshed (with that sign-in's details).
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 
 class LoginFailure(Base):

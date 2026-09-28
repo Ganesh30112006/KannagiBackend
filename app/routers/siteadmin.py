@@ -20,6 +20,7 @@ from .. import site, sync
 from ..config import settings
 from ..database import get_db, takes_turns
 from ..models import (
+    AlertDevice,
     ManualSale,
     ManualSaleItem,
     Order,
@@ -65,13 +66,20 @@ from .admin import _with_customers
 
 router = APIRouter(prefix="/site-admin", tags=["site admin"], dependencies=[Depends(site_admin)])
 
-FREE_PICK_SUFFIX = " (free ₹10 pick)"  # how orders.py records a free item taken from stock
+# How orders.py records a free item she picked, taken from stock: "Munch (free ₹10 pick)".
+FREE_PICK = re.compile(r"(.+) \(free ₹\d+(?:\.\d+)? pick\)")
 ACTIVE = User.deleted_at.is_(None)  # deleted accounts kept only for their orders are left out
 MAIN_ADMIN = "the main admin is set in the server settings (ADMIN_MOBILE, ADMIN_PASSWORD)"
 
 
 def _admin_out(db: Session) -> SiteAdminOut:
     return SiteAdminOut(**site.values(db).model_dump(), photo_uploads_enabled=settings.cloudinary_url != "")
+
+
+def picked_item(freebie: object) -> str | None:
+    """The item's name, when an order's freebie is a free item she picked from stock."""
+    match = FREE_PICK.fullmatch(freebie) if isinstance(freebie, str) else None
+    return match.group(1) if match else None
 
 
 def _sign_out(user: User) -> None:
@@ -315,12 +323,7 @@ def profit(period: InvestmentPeriod = "month", db: Session = Depends(get_db)) ->
     manual_sales = _sales(db, [ManualSale.id, ManualSale.created_at, ManualSale.total], ManualSaleItem, ManualSaleItem.sale_id == ManualSale.id, kept)
 
     # Items by name now (on sale first, then the newest): emojis, and what a free pick cost.
-    picks = {
-        gift.removesuffix(FREE_PICK_SUFFIX)
-        for (*_, freebies), _ in orders
-        for gift in freebies or []
-        if isinstance(gift, str) and gift.endswith(FREE_PICK_SUFFIX)
-    }
+    picks = {name for (*_, freebies), _ in orders for gift in freebies or [] if (name := picked_item(gift))}
     names = {name for _, lines in (*orders, *manual_sales) for name, *_ in lines} | picks
     catalog = {
         product.name: product
@@ -333,7 +336,8 @@ def profit(period: InvestmentPeriod = "month", db: Session = Depends(get_db)) ->
         for gift in freebies or []:
             if not isinstance(gift, str):
                 continue
-            picked = catalog.get(gift.removesuffix(FREE_PICK_SUFFIX)) if gift.endswith(FREE_PICK_SUFFIX) else None
+            name = picked_item(gift)
+            picked = catalog.get(name) if name else None
             if picked is not None:
                 cost += paise(picked.purchase_price)
             elif found := GIFT_PRICE.search(gift):
@@ -677,7 +681,7 @@ def delete_user(user_id: str, db: Session = Depends(get_db), admin: User = Depen
             .values(customer_name=profile.full_name, customer_phone=profile.phone, customer_block=profile.block, customer_room=profile.room_number)
         )
     voted = db.scalar(select(func.count()).select_from(WishRequest).where(WishRequest.user_id == user.id))
-    for model in (Profile, WishRequest, Spin, ResetRequest):
+    for model in (Profile, WishRequest, Spin, ResetRequest, AlertDevice):
         db.execute(delete(model).where(model.user_id == user.id))
     if db.scalar(select(Order.id).where(Order.user_id == user.id).limit(1)) is None:
         db.delete(user)
@@ -767,8 +771,7 @@ def cancel_order(order_id: IdPath, db: Session = Depends(get_db)) -> AdminOrderO
         if item.product_id is not None:
             back[item.product_id] = back.get(item.product_id, 0) + item.quantity
     for freebie in order.freebies or []:
-        if freebie.endswith(FREE_PICK_SUFFIX):
-            name = freebie.removesuffix(FREE_PICK_SUFFIX)
+        if name := picked_item(freebie):
             product_id = db.scalar(select(Product.id).where(Product.name == name, Product.active).order_by(Product.id).limit(1))
             if product_id is not None:
                 back[product_id] = back.get(product_id, 0) + 1

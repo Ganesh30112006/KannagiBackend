@@ -50,8 +50,14 @@ class Settings(BaseSettings):
     enable_docs: bool = False
     shop_timezone: str = "Asia/Kolkata"
     max_request_bytes: int = 4 * 1024 * 1024
+    # Order alerts (a notification for each new order on the shopkeepers' phones and laptops): the shop's
+    # own private key, made once with `python -m app.webpush`. Unset, the dashboard says alerts aren't set
+    # up. Changing it turns alerts off on every device until it's turned on again there.
+    vapid_private_key: str = ""
+    # How the push services (Google, Apple, Mozilla, Microsoft) can reach the shop about its alerts.
+    push_contact: str = "https://kannagimart.tech"
 
-    @field_validator("admin_mobile", "admin_password", "jwt_secret", "internal_api_key", "database_url", "cloudinary_url")
+    @field_validator("admin_mobile", "admin_password", "jwt_secret", "internal_api_key", "database_url", "cloudinary_url", "vapid_private_key", "push_contact")
     @classmethod
     def _strip(cls, value: str) -> str:
         # A value pasted into a dashboard with a space or newline around it would otherwise never match
@@ -102,6 +108,16 @@ class Settings(BaseSettings):
             raise ValueError("CLOUDINARY_URL must look like cloudinary://<api_key>:<api_secret>@<cloud_name>")
         return CloudinaryAccount(parsed.hostname, unquote(parsed.username), unquote(parsed.password))
 
+    @cached_property
+    def vapid_key(self):
+        """The order alerts' signing key (VAPID_PRIVATE_KEY), or None when alerts aren't set up. Raises
+        ValueError for a key that isn't one."""
+        if not self.vapid_private_key:
+            return None
+        from .webpush import private_key
+
+        return private_key(self.vapid_private_key)
+
     def check(self) -> None:
         """Refuse to run in production with missing or weak secrets."""
         problems = []
@@ -121,6 +137,12 @@ class Settings(BaseSettings):
             self.cloudinary  # noqa: B018 - validates the URL format
         except ValueError as error:
             problems.append(str(error))
+        try:
+            self.vapid_key  # noqa: B018 - validates the key
+        except ValueError as error:
+            problems.append(str(error))
+        if not self.push_contact.startswith(("https://", "mailto:")):
+            problems.append("PUSH_CONTACT must be a web address (https://...) or mailto:")
         if not problems:
             return
         if self.is_production:

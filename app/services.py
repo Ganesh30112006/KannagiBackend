@@ -68,8 +68,11 @@ def active_prizes(row: MartSettings) -> list[dict]:
 # website's checkout preview (frontend/src/lib/pricing.ts) to the paisa. Keep the two in step.
 
 ROOM_DELIVERY_FEE_PAISE = ROOM_DELIVERY_FEE * 100
-FREE_PICK_SAVINGS = 1000  # the ₹10 free item
-TIER50_SAVINGS = 500  # the ₹5 chocolate
+# The free ₹10 item of a spin coupon, and of the ₹100+ offer unless the shop sets its own limit: any item
+# with an MRP up to ₹12.
+FREE_PICK_VALUE, FREE_PICK_MAX_PRICE = 10, 12
+# What each offer gives unless the shop set its own amounts (see schemas.DailyOffer).
+FIRST_ORDER_PERCENT, BULK_PERCENT, TIER50_GIFT = 10, 20, 5
 
 
 def paise(rupees: float) -> int:
@@ -137,10 +140,17 @@ def coupon_eligible(kind: str, cart: Cart, delivery: str) -> bool:
 class Deal:
     kind: str | None = None  # "coupon", "bulk", "first", "tier100", "tier50"
     label: str | None = None
-    discount: int = 0  # paise
+    discount: int = 0  # paise (a room delivery fee it waives included)
     coupon: Spin | None = None
-    free_pick: bool = False  # the customer gets a free ₹10 item of her choice
+    free_pick: bool = False  # the customer gets a free item of her choice...
+    pick_value: int = FREE_PICK_VALUE  # ...worth ₹ (how the order names it)...
+    pick_up_to: int = FREE_PICK_MAX_PRICE  # ...with an MRP up to ₹
     freebies: list[str] = field(default_factory=list)
+
+
+def gift_text(rupees: int) -> str:
+    """A free chocolate as an order lists it (the admin's Profit page reads the ₹ amount)."""
+    return f"₹{rupees} chocolate (free)"
 
 
 def coupon_value(kind: str, delivery_fee: int = ROOM_DELIVERY_FEE_PAISE) -> int:
@@ -163,7 +173,8 @@ def best_deal(
 ) -> Deal:
     """Only one reward applies per order. With COUPON_RULE "best" the one that saves the most wins
     (ties keep the automatic offer, so the coupon stays for later); with "coupon" an eligible spin
-    coupon always wins. delivery_fee is in paise."""
+    coupon always wins. delivery_fee is in paise. The offers give the amounts the shop set on their cards
+    (schemas.DailyOffer). Keep in step with quote() in frontend/src/lib/pricing.ts."""
     fee = delivery_fee if delivery == "Room Delivery" else 0
     offers = {offer["id"]: offer for offer in row.daily_offers}
 
@@ -173,23 +184,36 @@ def best_deal(
     def title(offer_id: str, fallback: str) -> str:
         return offers.get(offer_id, {}).get("title") or fallback
 
+    def amount(offer_id: str, name: str, default):
+        value = offers.get(offer_id, {}).get(name)
+        return default if value is None else value
+
     # (savings, deal) in priority order; ties keep the earlier one.
     candidates: list[tuple[int, Deal]] = []
     if active("bulk") and cart.subtotal > 20000:
-        amount = percent_off(cart.subtotal, 20)
-        candidates.append((amount, Deal(kind="bulk", label=title("bulk", "Bulk order 20% OFF"), discount=amount)))
+        percent = amount("bulk", "percent", BULK_PERCENT)
+        off = percent_off(cart.subtotal, percent)
+        waived = fee if amount("bulk", "freeDelivery", False) else 0
+        gift = amount("bulk", "gift", 0)
+        label = title("bulk", f"Bulk order {percent}% OFF")
+        deal = Deal(kind="bulk", label=label, discount=off + waived, freebies=[gift_text(gift)] if gift else [])
+        candidates.append((off + waived + gift * 100, deal))
     if active("first") and first_order:
-        amount = percent_off(cart.subtotal, 10)
-        candidates.append((amount, Deal(kind="first", label=title("first", "First order 10% OFF"), discount=amount)))
+        percent = amount("first", "percent", FIRST_ORDER_PERCENT)
+        off = percent_off(cart.subtotal, percent)
+        candidates.append((off, Deal(kind="first", label=title("first", f"First order {percent}% OFF"), discount=off)))
     if active("tier100") and cart.subtotal >= 10000:
-        candidates.append((FREE_PICK_SAVINGS, Deal(kind="tier100", label=title("tier100", "₹100+ Offer"), free_pick=True)))
+        up_to = amount("tier100", "pickUpTo", None)
+        value, limit = (FREE_PICK_VALUE, FREE_PICK_MAX_PRICE) if up_to is None else (up_to, up_to)
+        deal = Deal(kind="tier100", label=title("tier100", "₹100+ Offer"), free_pick=True, pick_value=value, pick_up_to=limit)
+        candidates.append((value * 100, deal))
     elif active("tier50") and cart.subtotal >= 5000:
-        deal = Deal(kind="tier50", label=title("tier50", "₹50+ Offer"), freebies=["₹5 chocolate (free)"])
-        candidates.append((TIER50_SAVINGS, deal))
+        gift = amount("tier50", "gift", TIER50_GIFT)
+        candidates.append((gift * 100, Deal(kind="tier50", label=title("tier50", "₹50+ Offer"), freebies=[gift_text(gift)] if gift else [])))
 
     if coupon and coupon.kind and coupon_eligible(coupon.kind, cart, delivery):
         if coupon.kind == "freeSnack100":
-            savings, deal = FREE_PICK_SAVINGS, Deal(kind="coupon", label=coupon.label, coupon=coupon, free_pick=True)
+            savings, deal = FREE_PICK_VALUE * 100, Deal(kind="coupon", label=coupon.label, coupon=coupon, free_pick=True)
         else:
             savings = min(coupon_value(coupon.kind, delivery_fee), cart.subtotal + fee)
             deal = Deal(kind="coupon", label=coupon.label, discount=savings, coupon=coupon)
