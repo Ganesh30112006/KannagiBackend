@@ -504,6 +504,12 @@ class PaymentIn(CamelModel):
     received: bool
 
 
+class FulfilIn(CamelModel):
+    # Handing over a UPI order whose payment isn't ticked yet: the shopkeeper says the money arrived,
+    # which confirms the payment in the same step.
+    payment_received: bool = False
+
+
 class OrderItemOut(CamelModel):
     name: str
     qty: int

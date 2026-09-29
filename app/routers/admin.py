@@ -12,6 +12,7 @@ from ..database import get_db, takes_turns
 from ..models import ManualSale, ManualSaleItem, Order, OrderItem, Product, Profile, StockEntry, User, utcnow
 from ..schemas import (
     AdminOrderOut,
+    FulfilIn,
     IdPath,
     ManualSaleIn,
     ManualSaleItemOut,
@@ -358,15 +359,17 @@ def _locked_order(db: Session, order_id: int) -> Order | None:
     return db.get(Order, order_id, options=[selectinload(Order.items)], with_for_update=True)
 
 
-def _set_fulfilled(db: Session, order_id: int, fulfilled: bool) -> AdminOrderOut:
+def _set_fulfilled(db: Session, order_id: int, fulfilled: bool, payment_received: bool = False) -> AdminOrderOut:
     order = _locked_order(db, order_id)
     if order is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Order not found.")
     if order.cancelled:
         raise HTTPException(status.HTTP_409_CONFLICT, "This order was cancelled.")
     if fulfilled and order.payment == "UPI" and not order.payment_confirmed:
-        # A UPI order is only confirmed once its payment is.
-        raise HTTPException(status.HTTP_409_CONFLICT, "Confirm the UPI payment first: tap Payment received once you see it in PhonePe.")
+        # A UPI order is only confirmed once its payment is: ticked before, or said to have arrived now.
+        if not payment_received:
+            raise HTTPException(status.HTTP_409_CONFLICT, "Confirm the UPI payment first: tap Payment received once you see it in PhonePe.")
+        order.payment_confirmed = True
     order.fulfilled = fulfilled
     sync.bump(db, sync.ORDERS)
     db.commit()
@@ -375,8 +378,9 @@ def _set_fulfilled(db: Session, order_id: int, fulfilled: bool) -> AdminOrderOut
 
 @router.post("/orders/{order_id}/fulfill", response_model=AdminOrderOut, response_model_exclude_none=True)
 @takes_turns
-def fulfill_order(order_id: IdPath, db: Session = Depends(get_db)) -> AdminOrderOut:
-    return _set_fulfilled(db, order_id, True)
+def fulfill_order(order_id: IdPath, body: FulfilIn | None = None, db: Session = Depends(get_db)) -> AdminOrderOut:
+    """Hand the order over. The body is optional (no body: the payment must already be confirmed)."""
+    return _set_fulfilled(db, order_id, True, body is not None and body.payment_received)
 
 
 @router.post("/orders/{order_id}/payment", response_model=AdminOrderOut, response_model_exclude_none=True)
