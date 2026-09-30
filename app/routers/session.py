@@ -38,7 +38,7 @@ def bootstrap(user: User = Depends(current_user), db: Session = Depends(get_db))
         "revs": revs,
         "site": _json(site.public(db)),
         "user": _json(user_out(user)),
-        "products": _json(list_products(db), drop_none=True),
+        "products": _json(list_products(user=user, db=db), drop_none=True),
         "orders": _json(my_orders(user, db), drop_none=True),
         "profile": _json(get_profile(user, db)),
         "promotions": _json(promotions(db)),
@@ -80,7 +80,7 @@ def sync_changes(
     if site_rev != revs[sync.SITE]:
         result["site"] = _json(site.public(db))
     if catalog != revs[sync.CATALOG]:
-        result["products"] = _json(list_products(db), drop_none=True)
+        result["products"] = _json(list_products(user=user, db=db), drop_none=True)
     if promotions_rev != revs[sync.PROMOTIONS]:
         result["promotions"] = _json(promotions(db))
     if wishes != revs[sync.WISHES]:
@@ -101,7 +101,7 @@ def sync_changes(
 def live(user: User = Depends(current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
     """Stock, store status and the customer's coupon. Kept for website builds from before /sync."""
     return {
-        "products": _json(list_products(db), drop_none=True),
+        "products": _json(list_products(user=user, db=db), drop_none=True),
         "store": _json(store_status(db)),
         "spin": _json(spin_status(user, db)),
     }

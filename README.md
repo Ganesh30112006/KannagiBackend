@@ -1,6 +1,6 @@
 # Kannagi Night Mart API
 
-The API behind the Kannagi Night Mart website: accounts, catalog, orders, manual (in-person) sales, sales figures, a record of stock added and taken off (for the admin's Investment page: new stock bought and the value of the stock left), profit day by day and item by item (the admin's Profit page), offers (the amounts each offer card gives, set by the shop), the spin wheel, order alerts (Web Push notifications to the shopkeepers' devices for each new order) and the admin console. FastAPI + SQLAlchemy, Neon Postgres in production, SQLite in development. It runs on Render's own Python runtime (no Docker).
+The API behind the Kannagi Night Mart website: accounts, catalog (customers see only items in stock), wishlist requests (cleared when the item is added; admins can remove them), orders, manual (in-person) sales, sales figures, a record of stock added and taken off (for the admin's Investment page: new stock bought and the value of the stock left), profit day by day and item by item (the admin's Profit page), offers (the amounts each offer card gives, set by the shop), the spin wheel, order alerts (Web Push notifications to the shopkeepers' devices for each new order) and the admin console. FastAPI + SQLAlchemy, Neon Postgres in production, SQLite in development. It runs on Render's own Python runtime (no Docker).
 
 ## How it's secured
 

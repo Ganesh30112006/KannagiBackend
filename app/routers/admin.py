@@ -33,6 +33,7 @@ from ..security import shopkeeper
 from ..images import ImageStoreError, delete_image, store_image
 from ..services import cart_summary, get_settings, order_out, paise, product_out, rupees, sale_price, store_online, to_ms
 from .orders import _take
+from .shop import clear_wishes
 
 router = APIRouter(prefix="/admin", tags=["admin"], dependencies=[Depends(shopkeeper)])
 
@@ -130,6 +131,8 @@ def create_product(body: ProductCreate, user: User = Depends(shopkeeper), db: Se
     db.add(product)
     db.flush()
     _log_stock(db, product, product.stock, user)
+    if product.stock > 0:
+        clear_wishes(db, product.name)  # customers asked for it, and now they can buy it
     sync.bump(db, sync.CATALOG)
     db.commit()
     return product_out(product)
@@ -161,7 +164,7 @@ def _apply_update(db: Session, product_id: int, body: ProductUpdate, image_url: 
     """With the item locked, so quick taps or two shopkeepers changing its stock at once each start from
     the stock the one before left, and its stock entry adds up the same way."""
     product = _get_product(db, product_id, lock=True)
-    old_image, old_stock = product.image_url, product.stock
+    old_image, old_stock, old_name = product.image_url, product.stock, product.name
     fields = body.model_fields_set
     if "name" in fields and body.name:
         product.name = body.name
@@ -179,6 +182,10 @@ def _apply_update(db: Session, product_id: int, body: ProductUpdate, image_url: 
     if "image" in fields:
         product.image_url = image_url
     _log_stock(db, product, product.stock - old_stock, user)
+    if product.stock > 0 and (product.stock > old_stock or product.name != old_name):
+        # Restocked (customers don't see an item with no stock, so they may have asked for it) or renamed
+        # to what they asked for: now they can buy it.
+        clear_wishes(db, product.name)
     sync.bump(db, sync.CATALOG)
     db.commit()
     return product, old_image

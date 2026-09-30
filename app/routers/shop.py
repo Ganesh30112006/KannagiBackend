@@ -1,7 +1,7 @@
 """Read-only shop data for signed-in customers, plus wishlist requests."""
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -9,7 +9,7 @@ from .. import site, sync
 from ..database import get_db
 from ..models import Product, User, WishRequest
 from ..schemas import ProductOut, Promotions, StoreStatus, WishIn, WishOut, WishResult
-from ..security import current_user
+from ..security import current_user, has_shop_access
 from ..services import get_settings, product_out, store_online
 
 router = APIRouter(tags=["shop"], dependencies=[Depends(current_user)])
@@ -19,9 +19,12 @@ WISHES_SHOWN = 50
 
 
 @router.get("/products", response_model=list[ProductOut], response_model_exclude_none=True)
-def list_products(db: Session = Depends(get_db)) -> list[ProductOut]:
-    products = db.scalars(select(Product).where(Product.active).order_by(Product.id))
-    return [product_out(product) for product in products]
+def list_products(user: User = Depends(current_user), db: Session = Depends(get_db)) -> list[ProductOut]:
+    """Customers see only what they can buy (in stock); the shop sees its whole inventory."""
+    query = select(Product).where(Product.active)
+    if not has_shop_access(user):
+        query = query.where(Product.stock > 0)
+    return [product_out(product) for product in db.scalars(query.order_by(Product.id))]
 
 
 @router.get("/store", response_model=StoreStatus)
@@ -44,6 +47,19 @@ def promotions(db: Session = Depends(get_db)) -> Promotions:
     )
 
 
+def wish_key(name: str) -> str:
+    """Requests for the same item match whatever the capitals and spacing ("Dark  Fantasy" = "dark fantasy")."""
+    return " ".join(name.lower().split())
+
+
+def clear_wishes(db: Session, name: str) -> bool:
+    """The requests for an item, taken off the list (not committed). True if there were any."""
+    removed = db.execute(delete(WishRequest).where(WishRequest.item_key == wish_key(name))).rowcount
+    if removed:
+        sync.bump(db, sync.WISHES)
+    return bool(removed)
+
+
 def _wish_counts(db: Session) -> list[WishOut]:
     rows = db.execute(
         select(WishRequest.item_key, func.min(WishRequest.label), func.count())
@@ -61,7 +77,7 @@ def list_wishes(db: Session = Depends(get_db)) -> list[WishOut]:
 
 @router.post("/wishes", response_model=WishResult)
 def add_wish(body: WishIn, user: User = Depends(current_user), db: Session = Depends(get_db)) -> WishResult:
-    key = " ".join(body.name.lower().split())
+    key = wish_key(body.name)
     already = db.scalar(select(WishRequest.id).where(WishRequest.user_id == user.id, WishRequest.item_key == key))
     if not already:
         mine = db.scalar(select(func.count()).where(WishRequest.user_id == user.id)) or 0

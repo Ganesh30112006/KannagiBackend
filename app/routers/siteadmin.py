@@ -58,11 +58,13 @@ from ..schemas import (
     StockEntryOut,
     StockLeft,
     StoredProfile,
+    WishIn,
 )
 from ..security import create_token, hash_password, site_admin, verify_password
 from ..services import get_settings, is_egg, paise, rupees, sale_price, shop_now, store_online, to_ms, user_out
 from ..staff import is_owner
 from .admin import _with_customers
+from .shop import clear_wishes
 
 router = APIRouter(prefix="/site-admin", tags=["site admin"], dependencies=[Depends(site_admin)])
 
@@ -693,6 +695,18 @@ def delete_user(user_id: str, db: Session = Depends(get_db), admin: User = Depen
         _sign_out(user)
     if voted:
         sync.bump(db, sync.WISHES)
+    db.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+# --- wishlist requests ---
+
+
+@router.post("/wishes/remove", status_code=status.HTTP_204_NO_CONTENT)
+def remove_wish(body: WishIn, db: Session = Depends(get_db)) -> Response:
+    """Take an item's requests off the wishlist, every customer's (the list shows them as one line).
+    Nothing to remove (already removed, e.g. by another admin) is fine too."""
+    clear_wishes(db, body.name)
     db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
