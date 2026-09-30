@@ -1,5 +1,6 @@
-"""Order alerts on a shopkeeper's or admin's phone or laptop (see alerts.py): turning them on and off for
-one device, and a test alert."""
+"""Notifications on a phone or laptop (see alerts.py): turning them on and off for one device, a test,
+and (admins) the day's summary now. For any signed-in account: what a device gets follows the sign-in
+that turned it on (new orders for shopkeepers and admins, her own orders and requests for a customer)."""
 
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 from sqlalchemy import delete, select
@@ -11,11 +12,11 @@ from .. import alerts
 from ..database import get_db
 from ..models import AlertDevice, User, utcnow
 from ..schemas import AlertDeviceIn, AlertEndpointIn, AlertKeyOut, AlertTestOut
-from ..security import _password_version, shopkeeper
+from ..security import _password_version, current_user, is_site_admin
 
-router = APIRouter(prefix="/alerts", tags=["order alerts"], dependencies=[Depends(shopkeeper)])
+router = APIRouter(prefix="/alerts", tags=["notifications"], dependencies=[Depends(current_user)])
 
-NOT_SET_UP = "Order alerts aren't set up for this shop yet."
+NOT_SET_UP = "Notifications aren't set up for this shop yet."
 
 
 @router.get("/key", response_model=AlertKeyOut)
@@ -25,7 +26,7 @@ def key() -> AlertKeyOut:
 
 
 @router.put("/device", status_code=status.HTTP_204_NO_CONTENT)
-def turn_on(body: AlertDeviceIn, user: User = Depends(shopkeeper), db: Session = Depends(get_db)) -> Response:
+def turn_on(body: AlertDeviceIn, user: User = Depends(current_user), db: Session = Depends(get_db)) -> Response:
     """Alerts on for this device, for this sign-in. The dashboard sends it again each time it opens, which
     keeps the device on the latest sign-in there."""
     if alerts.signing_key() is None:
@@ -57,7 +58,7 @@ def turn_on(body: AlertDeviceIn, user: User = Depends(shopkeeper), db: Session =
 
 
 @router.post("/device/off", status_code=status.HTTP_204_NO_CONTENT)
-def turn_off(body: AlertEndpointIn, user: User = Depends(shopkeeper), db: Session = Depends(get_db)) -> Response:
+def turn_off(body: AlertEndpointIn, user: User = Depends(current_user), db: Session = Depends(get_db)) -> Response:
     """Alerts off for this device (also when signing out on it). Nothing to do if they weren't on."""
     db.execute(delete(AlertDevice).where(AlertDevice.endpoint == body.endpoint, AlertDevice.user_id == user.id))
     db.commit()
@@ -65,9 +66,24 @@ def turn_off(body: AlertEndpointIn, user: User = Depends(shopkeeper), db: Sessio
 
 
 @router.post("/test", response_model=AlertTestOut, response_model_exclude_none=True)
-def test(body: AlertEndpointIn, user: User = Depends(shopkeeper), db: Session = Depends(get_db)) -> AlertTestOut:
+def test(body: AlertEndpointIn, user: User = Depends(current_user), db: Session = Depends(get_db)) -> AlertTestOut:
     """A test alert to this device, so the shopkeeper sees what an order's looks like."""
     device = db.scalar(select(AlertDevice).where(AlertDevice.endpoint == body.endpoint, AlertDevice.user_id == user.id))
     if device is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Order alerts aren't on for this device. Turn them on again.")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Notifications aren't on for this device. Turn them on again.")
     return alerts.send_test(db, device)
+
+
+@router.post("/summary", response_model=AlertTestOut, response_model_exclude_none=True)
+def summary_now(body: AlertEndpointIn, user: User = Depends(current_user), db: Session = Depends(get_db)) -> AlertTestOut:
+    """Admins: today's summary (sent to every admin at closing time) to this device, now."""
+    if not is_site_admin(user):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Not Found")
+    device = db.scalar(select(AlertDevice).where(AlertDevice.endpoint == body.endpoint, AlertDevice.user_id == user.id))
+    if device is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Notifications aren't on for this device. Turn them on again.")
+    if alerts.signing_key() is None:
+        return AlertTestOut(sent=False, detail=NOT_SET_UP)
+    if alerts.send_summary(db, device) != 1:
+        return AlertTestOut(sent=False, detail="The browser's notification service didn't take it. Try again in a minute.")
+    return AlertTestOut(sent=True)

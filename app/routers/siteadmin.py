@@ -11,12 +11,12 @@ from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Response, status
 from sqlalchemy import and_, delete, func, or_, select, true, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
-from .. import site, sync
+from .. import alerts, site, sync
 from ..config import settings
 from ..database import get_db, takes_turns
 from ..models import (
@@ -68,8 +68,9 @@ from .shop import clear_wishes
 
 router = APIRouter(prefix="/site-admin", tags=["site admin"], dependencies=[Depends(site_admin)])
 
-# How orders.py records a free item she picked, taken from stock: "Munch (free ₹10 pick)".
-FREE_PICK = re.compile(r"(.+) \(free ₹\d+(?:\.\d+)? pick\)")
+# How orders.py records a free item she picked, taken from stock: "Munch (free ₹10 pick)", or with her
+# loyalty reward "Munch (loyalty free ₹10 pick)".
+FREE_PICK = re.compile(r"(.+) \((?:loyalty )?free ₹\d+(?:\.\d+)? pick\)")
 ACTIVE = User.deleted_at.is_(None)  # deleted accounts kept only for their orders are left out
 MAIN_ADMIN = "the main admin is set in the server settings (ADMIN_MOBILE, ADMIN_PASSWORD)"
 
@@ -764,7 +765,7 @@ def all_orders(
 
 @router.post("/orders/{order_id}/cancel", response_model=AdminOrderOut, response_model_exclude_none=True)
 @takes_turns
-def cancel_order(order_id: IdPath, db: Session = Depends(get_db)) -> AdminOrderOut:
+def cancel_order(order_id: IdPath, background: BackgroundTasks, db: Session = Depends(get_db)) -> AdminOrderOut:
     """Cancels an order that hasn't been handed over: its items (and any free pick) go back on the
     shelf, an unexpired spin coupon it used works again, and a first-order discount is available again
     if this was her only order. It no longer counts in sales. If she paid by UPI, the money is
@@ -807,4 +808,5 @@ def cancel_order(order_id: IdPath, db: Session = Depends(get_db)) -> AdminOrderO
         customer.first_order_used = False
     sync.bump(db, sync.ORDERS, sync.CATALOG)
     db.commit()
+    background.add_task(alerts.order_update, order.id, "cancelled")  # her devices hear it
     return _with_customers(db, [order])[0]

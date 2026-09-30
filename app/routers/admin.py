@@ -7,7 +7,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, R
 from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.orm import Session, selectinload
 
-from .. import site, sync
+from .. import alerts, site, sync
 from ..database import get_db, takes_turns
 from ..models import ManualSale, ManualSaleItem, Order, OrderItem, Product, Profile, StockEntry, User, utcnow
 from ..schemas import (
@@ -116,8 +116,8 @@ def _log_stock(db: Session, product: Product, change: int, user: User) -> None:
 
 
 @router.post("/products", response_model=ProductOut, response_model_exclude_none=True, status_code=status.HTTP_201_CREATED)
-def create_product(body: ProductCreate, user: User = Depends(shopkeeper), db: Session = Depends(get_db)) -> ProductOut:
-    """Its starting stock counts as stock bought."""
+def create_product(body: ProductCreate, background: BackgroundTasks, user: User = Depends(shopkeeper), db: Session = Depends(get_db)) -> ProductOut:
+    """Its starting stock counts as stock bought. Customers who asked for it hear that it's here."""
     image_url = _save_image(body.image)
     product = Product(
         name=body.name,
@@ -131,10 +131,11 @@ def create_product(body: ProductCreate, user: User = Depends(shopkeeper), db: Se
     db.add(product)
     db.flush()
     _log_stock(db, product, product.stock, user)
-    if product.stock > 0:
-        clear_wishes(db, product.name)  # customers asked for it, and now they can buy it
+    asked = clear_wishes(db, product.name) if product.stock > 0 else []  # they asked for it; now they can buy it
     sync.bump(db, sync.CATALOG)
     db.commit()
+    if asked:
+        background.add_task(alerts.back_in_stock, product.name, asked)
     return product_out(product)
 
 
@@ -153,14 +154,16 @@ def update_product(
     _get_product(db, product_id)  # a missing item is refused before a photo is uploaded for it
     # Uploaded before the item is locked: an upload can take seconds, and orders for it would wait.
     image_url = _save_image(body.image) if "image" in body.model_fields_set else None
-    product, old_image = _apply_update(db, product_id, body, image_url, user)
+    product, old_image, asked = _apply_update(db, product_id, body, image_url, user)
     if old_image != product.image_url:
         _forget_image(db, background, old_image)
+    if asked:
+        background.add_task(alerts.back_in_stock, product.name, asked)
     return product_out(product)
 
 
 @takes_turns
-def _apply_update(db: Session, product_id: int, body: ProductUpdate, image_url: str | None, user: User) -> tuple[Product, str | None]:
+def _apply_update(db: Session, product_id: int, body: ProductUpdate, image_url: str | None, user: User) -> tuple[Product, str | None, list[str]]:
     """With the item locked, so quick taps or two shopkeepers changing its stock at once each start from
     the stock the one before left, and its stock entry adds up the same way."""
     product = _get_product(db, product_id, lock=True)
@@ -179,16 +182,19 @@ def _apply_update(db: Session, product_id: int, body: ProductUpdate, image_url: 
         product.stock = max(wanted, 0)  # taking off more than there is leaves none
     if "threshold" in fields and body.threshold is not None:
         product.threshold = body.threshold
+    if "category" in fields and body.category:
+        product.category = body.category
     if "image" in fields:
         product.image_url = image_url
     _log_stock(db, product, product.stock - old_stock, user)
+    asked: list[str] = []
     if product.stock > 0 and (product.stock > old_stock or product.name != old_name):
         # Restocked (customers don't see an item with no stock, so they may have asked for it) or renamed
         # to what they asked for: now they can buy it.
-        clear_wishes(db, product.name)
+        asked = clear_wishes(db, product.name)
     sync.bump(db, sync.CATALOG)
     db.commit()
-    return product, old_image
+    return product, old_image, asked
 
 
 @router.delete("/products/{product_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -366,7 +372,8 @@ def _locked_order(db: Session, order_id: int) -> Order | None:
     return db.get(Order, order_id, options=[selectinload(Order.items)], with_for_update=True)
 
 
-def _set_fulfilled(db: Session, order_id: int, fulfilled: bool, payment_received: bool = False) -> AdminOrderOut:
+def _set_fulfilled(db: Session, order_id: int, fulfilled: bool, payment_received: bool = False) -> tuple[AdminOrderOut, bool]:
+    """Returns the order and whether it was just handed over (not already)."""
     order = _locked_order(db, order_id)
     if order is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Order not found.")
@@ -377,22 +384,27 @@ def _set_fulfilled(db: Session, order_id: int, fulfilled: bool, payment_received
         if not payment_received:
             raise HTTPException(status.HTTP_409_CONFLICT, "Confirm the UPI payment first: tap Payment received once you see it in PhonePe.")
         order.payment_confirmed = True
+    handed_over = fulfilled and not order.fulfilled
     order.fulfilled = fulfilled
     sync.bump(db, sync.ORDERS)
     db.commit()
-    return _with_customers(db, [order])[0]
+    return _with_customers(db, [order])[0], handed_over
 
 
 @router.post("/orders/{order_id}/fulfill", response_model=AdminOrderOut, response_model_exclude_none=True)
 @takes_turns
-def fulfill_order(order_id: IdPath, body: FulfilIn | None = None, db: Session = Depends(get_db)) -> AdminOrderOut:
-    """Hand the order over. The body is optional (no body: the payment must already be confirmed)."""
-    return _set_fulfilled(db, order_id, True, body is not None and body.payment_received)
+def fulfill_order(order_id: IdPath, background: BackgroundTasks, body: FulfilIn | None = None, db: Session = Depends(get_db)) -> AdminOrderOut:
+    """Hand the order over. The body is optional (no body: the payment must already be confirmed). The
+    customer's devices hear that it's ready (or on its way)."""
+    order, handed_over = _set_fulfilled(db, order_id, True, body is not None and body.payment_received)
+    if handed_over:
+        background.add_task(alerts.order_update, order.id, "fulfilled")
+    return order
 
 
 @router.post("/orders/{order_id}/payment", response_model=AdminOrderOut, response_model_exclude_none=True)
 @takes_turns
-def confirm_payment(order_id: IdPath, body: PaymentIn, db: Session = Depends(get_db)) -> AdminOrderOut:
+def confirm_payment(order_id: IdPath, body: PaymentIn, background: BackgroundTasks, db: Session = Depends(get_db)) -> AdminOrderOut:
     """The shopkeeper saw the UPI money arrive, which confirms the order (or undoes a mistaken tick)."""
     order = _locked_order(db, order_id)
     if order is None:
@@ -403,9 +415,12 @@ def confirm_payment(order_id: IdPath, body: PaymentIn, db: Session = Depends(get
         raise HTTPException(status.HTTP_409_CONFLICT, "This order is paid on delivery; there's no UPI payment to confirm.")
     if not body.received and order.fulfilled:
         raise HTTPException(status.HTTP_409_CONFLICT, "This order is already fulfilled. Undo that first.")
+    newly_confirmed = body.received and not order.payment_confirmed
     order.payment_confirmed = body.received
     sync.bump(db, sync.ORDERS)
     db.commit()
+    if newly_confirmed:
+        background.add_task(alerts.order_update, order.id, "confirmed")  # her devices: it's confirmed
     return _with_customers(db, [order])[0]
 
 
@@ -413,7 +428,7 @@ def confirm_payment(order_id: IdPath, body: PaymentIn, db: Session = Depends(get
 @takes_turns
 def unfulfill_order(order_id: IdPath, db: Session = Depends(get_db)) -> AdminOrderOut:
     """Undo a mistaken "Mark as Fulfilled" tap."""
-    return _set_fulfilled(db, order_id, False)
+    return _set_fulfilled(db, order_id, False)[0]
 
 
 # --- promotions & store status ---
@@ -433,7 +448,11 @@ def save_promotions(body: Promotions, db: Session = Depends(get_db)) -> Promotio
 
     row = get_settings(db)
     row.launch_message = body.launch_message.strip()
-    row.daily_offers = [offer.model_dump(by_alias=True, exclude_none=True) for offer in body.daily_offers]
+    offers = [offer.model_dump(by_alias=True, exclude_none=True) for offer in body.daily_offers]
+    if not any(offer["id"] == "loyalty" for offer in offers):
+        # A page from before the loyalty card existed doesn't send it: keep it as it is.
+        offers += [offer for offer in row.daily_offers if offer.get("id") == "loyalty"]
+    row.daily_offers = offers
     row.wheel_prizes = [prize.model_dump(by_alias=True) for prize in body.wheel_prizes]
     row.coupon_rule = body.coupon_rule
     sync.bump(db, sync.PROMOTIONS)

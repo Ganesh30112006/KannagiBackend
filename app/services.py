@@ -1,5 +1,6 @@
 """Business rules shared by the routers: pricing, offers, coupons, shop hours."""
 
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import ROUND_HALF_UP, Decimal
@@ -9,7 +10,7 @@ from sqlalchemy.orm import Session
 
 from .config import settings
 from .models import MartSettings, Order, Product, Spin, User, utcnow
-from .schemas import CouponOut, OrderItemOut, OrderOut, ProductOut, UserOut
+from .schemas import CouponOut, LoyaltyOut, OrderItemOut, OrderOut, ProductOut, UserOut
 from .security import has_shop_access, is_site_admin
 from .seed import DEFAULT_WHEEL_PRIZES
 from .staff import is_owner
@@ -73,6 +74,10 @@ ROOM_DELIVERY_FEE_PAISE = ROOM_DELIVERY_FEE * 100
 FREE_PICK_VALUE, FREE_PICK_MAX_PRICE = 10, 12
 # What each offer gives unless the shop set its own amounts (see schemas.DailyOffer).
 FIRST_ORDER_PERCENT, BULK_PERCENT, TIER50_GIFT = 10, 20, 5
+# Loyalty: every 10th completed order earns a free item she picks, MRP up to ₹10 (the card's amounts).
+LOYALTY_EVERY, LOYALTY_PICK_UP_TO = 10, 10
+# How an order records the loyalty reward it used: "Munch (loyalty free ₹10 pick)".
+LOYALTY_PICK = re.compile(r".+ \(loyalty free ₹\d+(?:\.\d+)? pick\)")
 
 
 def paise(rupees: float) -> int:
@@ -226,6 +231,36 @@ def best_deal(
         if savings > best_savings:
             best, best_savings = deal, savings
     return best
+
+
+# --- loyalty ---
+
+
+def loyalty_pick_text(name: str, up_to: int) -> str:
+    return f"{name} (loyalty free ₹{up_to} pick)"
+
+
+def loyalty_terms(row: MartSettings) -> tuple[bool, int, int]:
+    """(switched on, every how many completed orders, the free pick's MRP up to ₹), from its offer card."""
+    card = next((offer for offer in row.daily_offers if offer.get("id") == "loyalty"), None)
+    if card is None:
+        return False, LOYALTY_EVERY, LOYALTY_PICK_UP_TO
+    every, up_to = card.get("every"), card.get("pickUpTo")
+    return bool(card.get("active")), LOYALTY_EVERY if every is None else every, LOYALTY_PICK_UP_TO if up_to is None else up_to
+
+
+def loyalty(db: Session, user_id: str, row: MartSettings) -> LoyaltyOut:
+    """Her card, counted from her orders: completed ones (handed over, not cancelled) earn stamps, and an
+    order that used a reward (not cancelled) spends one. Nothing else is stored, so cancelling an order
+    that used a reward gives it back, and changing "every" on the card applies at once."""
+    active, every, up_to = loyalty_terms(row)
+    completed = used = 0
+    for fulfilled, freebies in db.execute(
+        select(Order.fulfilled, Order.freebies).where(Order.user_id == user_id, Order.cancelled.is_(False))
+    ):
+        completed += bool(fulfilled)
+        used += sum(1 for gift in freebies or [] if isinstance(gift, str) and LOYALTY_PICK.fullmatch(gift))
+    return LoyaltyOut(active=active, every=every, pick_up_to=up_to, stamps=completed % every, rewards=max(0, completed // every - used))
 
 
 # --- coupons ---

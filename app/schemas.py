@@ -11,7 +11,7 @@ from pydantic.alias_generators import to_camel
 from . import webpush
 
 CouponKind = Literal["free60", "three5", "freeSnack100", "halfDelivery", "four10", "premium5"]
-OfferId = Literal["tier50", "tier100", "first", "bulk"]
+OfferId = Literal["tier50", "tier100", "first", "bulk", "loyalty"]
 Block = Literal["A", "B", "C"]
 Delivery = Literal["Pickup", "Room Delivery"]
 Payment = Literal["UPI", "Pay on Delivery"]
@@ -184,6 +184,9 @@ class ProductOut(CamelModel):
     threshold: int
     category: str
     image: str | None = None
+    # Badges on the customer's shelf (only in the product list; left out when not true).
+    popular: bool | None = None  # among the best sellers of the last two weeks
+    is_new: bool | None = None  # added in the last week (the newest few)
 
 
 class ProductCreate(Stripped):
@@ -207,6 +210,7 @@ class ProductUpdate(Stripped):
     # Relative change applied atomically, so quick taps or two shopkeepers can't overwrite each other.
     stock_delta: int | None = Field(default=None, ge=-100_000, le=100_000)
     threshold: int | None = Field(default=None, ge=0, le=100_000)
+    category: str | None = Field(default=None, min_length=1, max_length=40)
     image: str | None = Field(default=None, max_length=MAX_IMAGE_LENGTH)
 
     _check_price = field_validator("mrp")(classmethod(_price))
@@ -227,7 +231,8 @@ class DailyOffer(CamelModel):
     percent: int | None = Field(default=None, ge=0, le=100)  # % off: first order (10), cart over ₹200 (20)
     free_delivery: bool | None = None  # cart over ₹200: no room delivery fee (no)
     gift: int | None = Field(default=None, ge=0, le=1000)  # a free chocolate worth ₹: ₹50+ (5), cart over ₹200 (none)
-    pick_up_to: int | None = Field(default=None, ge=1, le=1000)  # ₹100+: a free item she picks, MRP up to ₹ (₹10 item)
+    pick_up_to: int | None = Field(default=None, ge=1, le=1000)  # ₹100+ and loyalty: a free item she picks, MRP up to ₹ (₹10 item)
+    every: int | None = Field(default=None, ge=2, le=100)  # loyalty: every Nth completed order earns a free pick (10)
 
 
 class WheelPrize(CamelModel):
@@ -241,7 +246,7 @@ class WheelPrize(CamelModel):
 
 class Promotions(CamelModel):
     launch_message: str = Field(max_length=200)
-    daily_offers: list[DailyOffer] = Field(max_length=4)
+    daily_offers: list[DailyOffer] = Field(max_length=5)
     wheel_prizes: list[WheelPrize] = Field(min_length=2, max_length=16)
     coupon_rule: CouponRule = "best"
 
@@ -432,6 +437,7 @@ class WishOut(CamelModel):
 
 class WishResult(WishOut):
     already_requested: bool
+    on_shelf: bool = False  # it's in stock right now: nothing to ask for (nothing was saved)
 
 
 # --- spin wheel ---
@@ -479,6 +485,8 @@ class OrderIn(Stripped):
     # The total the customer saw (and may already have paid by UPI). If prices or offers changed
     # since, the order is refused with the new total instead of silently charging a different amount.
     expected_total: float | None = Field(default=None, ge=0, le=10_000_000)
+    # Her loyalty reward, used on this order: the free item she picked (see LoyaltyOut).
+    loyalty_pick: str | None = Field(default=None, max_length=80)
 
     @field_validator("phone")
     @classmethod
@@ -583,6 +591,17 @@ class AlertEndpointIn(Stripped):
     """Which device: its push address."""
 
     endpoint: str = Field(min_length=1, max_length=webpush.MAX_ENDPOINT_LENGTH)
+
+
+class LoyaltyOut(CamelModel):
+    """A customer's loyalty card: every `every` completed (handed over, not cancelled) orders earn a free
+    item she picks at checkout, MRP up to ₹pick_up_to."""
+
+    active: bool  # the shop's loyalty offer card is switched on
+    every: int
+    pick_up_to: int
+    stamps: int  # completed orders toward the next reward (0 to every - 1)
+    rewards: int  # rewards earned and not used yet
 
 
 class AlertTestOut(CamelModel):

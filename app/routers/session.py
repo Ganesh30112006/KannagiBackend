@@ -10,7 +10,7 @@ from .. import site, sync
 from ..database import get_db
 from ..models import User
 from ..security import current_user, has_shop_access
-from ..services import user_out
+from ..services import get_settings, loyalty, user_out
 from .admin import MANUAL_SALES_SHOWN, recent_manual_sales, recent_orders, sales_summary
 from .orders import my_orders
 from .profile import get_profile
@@ -45,6 +45,7 @@ def bootstrap(user: User = Depends(current_user), db: Session = Depends(get_db))
         "store": _json(store_status(db)),
         "wishes": _json(list_wishes(db)),
         "spin": _json(spin_status(user, db)),
+        "loyalty": _json(loyalty(db, user.id, get_settings(db))),
     }
 
 
@@ -88,6 +89,9 @@ def sync_changes(
     if orders != revs[sync.ORDERS]:
         result["orders"] = _json(my_orders(user, db), drop_none=True)
         result["firstOrderAvailable"] = not user.first_order_used
+    if orders != revs[sync.ORDERS] or promotions_rev != revs[sync.PROMOTIONS]:
+        # Her stamps move when an order is handed over; the card's terms when the offers change.
+        result["loyalty"] = _json(loyalty(db, user.id, get_settings(db)))
     if has_shop_access(user) and admin_orders != revs[sync.ORDERS]:
         result["admin"] = {
             "orders": _json(recent_orders(limit=ADMIN_ORDERS, db=db), drop_none=True),

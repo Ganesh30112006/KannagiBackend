@@ -13,6 +13,8 @@ from ..services import (
     current_coupon,
     format_money,
     get_settings,
+    loyalty,
+    loyalty_pick_text,
     order_out,
     paise,
     rupees,
@@ -167,15 +169,30 @@ def place_order(body: OrderIn, background: BackgroundTasks, user: User = Depends
         customer_block=contact[2],
         customer_room=contact[3],
     )
-    # Stock is taken in product-number order (the lock order above), the free pick included.
+    # Her loyalty reward, if she picked its free item. Counted under her lock (above), so two orders at
+    # once can't both spend one reward.
+    reward, reward_up_to = None, 0
+    if body.loyalty_pick:
+        card = loyalty(db, user.id, row)
+        if not card.active:
+            raise _conflict("The loyalty offer is switched off right now. Please place your order without the free item.")
+        if card.rewards < 1:
+            raise _conflict("You don't have a loyalty reward to use yet. Please place your order without the free item.")
+        reward, reward_up_to = _free_pick(db, body.loyalty_pick, card.pick_up_to), card.pick_up_to
+        if reward is None:
+            raise _conflict(f"{body.loyalty_pick} can't be your free item right now. Please pick another one.")
+    # Stock is taken in product-number order (the lock order above), the free picks included.
     free_pick = _free_pick(db, body.free_pick, deal.pick_up_to) if deal.free_pick else None
     given = None
-    for product_id in sorted({*quantities, *([free_pick.id] if free_pick else [])}):
+    for product_id in sorted({*quantities, *([free_pick.id] if free_pick else []), *([reward.id] if reward else [])}):
         if product_id in quantities and not _take(db, product_id, quantities[product_id]):
             db.rollback()
             raise _conflict(f"{products[product_id].name} just sold out. Please update your cart.")
         if free_pick is not None and product_id == free_pick.id and _take(db, product_id, 1):
             given = free_pick.name
+        if reward is not None and product_id == reward.id and not _take(db, product_id, 1):
+            db.rollback()
+            raise _conflict(f"{reward.name} just ran out. Please pick another free item.")
     for product, qty in lines:
         order.items.append(
             OrderItem(
@@ -189,6 +206,8 @@ def place_order(body: OrderIn, background: BackgroundTasks, user: User = Depends
     if deal.free_pick:
         # The admin's Profit page and cancelling read these (siteadmin.picked_item).
         order.freebies.append(f"{given} (free ₹{deal.pick_value} pick)" if given else f"₹{deal.pick_value} free snack")
+    if reward is not None:
+        order.freebies.append(loyalty_pick_text(reward.name, reward_up_to))  # read by services.loyalty
     # Conditional updates: two orders sent at the same moment can't both use one coupon or the
     # first-order discount.
     if deal.coupon:
