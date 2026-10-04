@@ -58,7 +58,11 @@ ADDED_COLUMNS = {
         "deleted_at": "TIMESTAMP",
         "is_customer": "BOOLEAN NOT NULL DEFAULT FALSE",
     },
-    "mart_settings": {"coupon_rule": "VARCHAR(10) NOT NULL DEFAULT 'best'"},
+    "mart_settings": {
+        "coupon_rule": "VARCHAR(10) NOT NULL DEFAULT 'best'",
+        "wheel_enabled": "BOOLEAN NOT NULL DEFAULT TRUE",
+    },
+    "spins": {"min_order": "INTEGER", "min_items": "INTEGER", "amount": "INTEGER"},
     "orders": {
         "customer_name": "VARCHAR(100)",
         "customer_phone": "VARCHAR(20)",

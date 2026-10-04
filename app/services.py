@@ -20,8 +20,6 @@ MARKUP = 5  # every item sells at MRP + ₹5 (eggs: + ₹5 once per bundle)
 ROOM_DELIVERY_FEE = 10
 PREMIUM_PRICE = 45
 COUPON_HOURS = 48
-# Rupees off for each coupon kind (freeSnack100 gives a free ₹10 item instead).
-COUPON_VALUES = {"free60": 10, "three5": 5, "freeSnack100": 10, "halfDelivery": 5, "four10": 10, "premium5": 5}
 OPEN_HOUR, CLOSE_HOUR = 23, 1  # 11:00 PM – 1:00 AM
 
 
@@ -61,7 +59,7 @@ def store_online(row: MartSettings, open_hour: int = OPEN_HOUR, close_hour: int 
 
 def active_prizes(row: MartSettings) -> list[dict]:
     prizes = [prize for prize in row.wheel_prizes if prize.get("active")]
-    return prizes if len(prizes) >= 2 else DEFAULT_WHEEL_PRIZES
+    return [canonical_prize(prize) for prize in (prizes if len(prizes) >= 2 else DEFAULT_WHEEL_PRIZES)]
 
 
 # --- pricing ---
@@ -129,16 +127,109 @@ def cart_summary(lines: list[tuple[Product, int]], markup: int = MARKUP) -> Cart
     )
 
 
-def coupon_eligible(kind: str, cart: Cart, delivery: str) -> bool:
-    room = delivery == "Room Delivery"
+# --- spin coupons ---
+# A wheel slice gives one kind of reward, on the cart conditions the shop set on it (minOrder: items
+# subtotal ₹, minItems, amount ₹). A won coupon keeps the terms of its slice at that moment. Keep in step
+# with couponTerms() in frontend/src/lib/pricing.ts.
+DELIVERY_COUPONS = ("free60", "halfDelivery")  # room delivery only: the whole fee, or half of it
+PREMIUM_ITEMS = 2  # premium5: on 2 items of ₹45+
+# (minOrder, minItems, amount) of each kind when a slice or coupon doesn't set them: the original rules.
+# three5 and four10 are both "₹ off" (the shop sets its conditions).
+COUPON_DEFAULTS = {
+    "free60": (60, 0, 0),
+    "halfDelivery": (0, 0, 0),
+    "three5": (0, 3, 5),
+    "four10": (0, 4, 10),
+    "premium5": (0, 0, 5),
+    "freeSnack100": (100, 0, FREE_PICK_VALUE),
+}
+
+
+@dataclass(frozen=True)
+class CouponTerms:
+    kind: str
+    min_order: int  # ₹, items subtotal
+    min_items: int
+    amount: int  # ₹ off; freeSnack100: the free item's value; 0 for the delivery coupons
+    pick_up_to: int  # freeSnack100: the free item's MRP up to ₹ (else 0)
+
+
+def coupon_terms(kind: str, min_order: int | None = None, min_items: int | None = None, amount: int | None = None) -> CouponTerms:
+    default_order, default_items, default_amount = COUPON_DEFAULTS[kind]
+    value = 0 if kind in DELIVERY_COUPONS else default_amount if amount is None else amount
+    # A slice that doesn't set the free item's value keeps the original rule: ₹10, any item up to ₹12.
+    up_to = (FREE_PICK_MAX_PRICE if amount is None else amount) if kind == "freeSnack100" else 0
+    return CouponTerms(
+        kind=kind,
+        min_order=default_order if min_order is None else min_order,
+        min_items=default_items if min_items is None else min_items,
+        amount=value,
+        pick_up_to=up_to,
+    )
+
+
+def prize_terms(prize: dict) -> CouponTerms | None:
+    """A wheel slice's reward (None: Better Luck)."""
+    kind = prize.get("kind")
+    if kind not in COUPON_DEFAULTS:
+        return None
+    return coupon_terms(kind, prize.get("minOrder"), prize.get("minItems"), prize.get("amount"))
+
+
+def spin_terms(spin: Spin) -> CouponTerms | None:
+    if spin.kind not in COUPON_DEFAULTS:
+        return None
+    return coupon_terms(spin.kind, spin.min_order, spin.min_items, spin.amount)
+
+
+def prize_text(terms: CouponTerms | None) -> tuple[str, str]:
+    """What a slice says (its label, and the short text on the wheel), made from what it gives, so the
+    two always match. Keep in step with prizeText() in frontend/src/lib/pricing.ts."""
+    if terms is None:
+        return "Better Luck Next Time", "BETTER LUCK!"
+    amount = terms.amount
+    gives, short = {
+        "free60": ("FREE Delivery", "FREE DELIVERY"),
+        "halfDelivery": ("50% OFF Room Delivery", "½ DELIVERY"),
+        "premium5": (f"₹{amount} OFF on {PREMIUM_ITEMS} Premium Items", f"{PREMIUM_ITEMS} PREMIUM ₹{amount} OFF"),
+        "freeSnack100": (f"Free ₹{amount} Snack", f"FREE ₹{amount} SNACK"),
+    }.get(terms.kind, (f"₹{amount} OFF", f"₹{amount} OFF"))
+    if terms.min_order:
+        gives, short = f"{gives} on ₹{terms.min_order}+ Orders", f"{short} ₹{terms.min_order}+"
+    if terms.min_items:
+        gives, short = f"{gives} with {terms.min_items}+ Items", f"{short} · {terms.min_items}+ ITEMS"
+    return gives, short
+
+
+def canonical_prize(prize: dict) -> dict:
+    """A slice as stored: its amounts written out (the original ones when it had none), "₹ off" as
+    three5, and its text made from them."""
+    kind = prize.get("kind")
+    if kind == "four10":
+        kind = "three5"  # both are "₹ off"; four10's own amounts are written out below
+    terms = prize_terms(prize)
+    if terms is not None and kind != terms.kind:
+        terms = coupon_terms(kind, terms.min_order, terms.min_items, terms.amount)
+    label, short = prize_text(terms)
     return {
-        "free60": cart.subtotal >= 6000 and room,
-        "three5": cart.item_count >= 3,
-        "freeSnack100": cart.subtotal >= 10000,
-        "halfDelivery": room,
-        "four10": cart.item_count >= 4,
-        "premium5": cart.premium_count >= 2,
-    }.get(kind, False)
+        "code": prize["code"],
+        "label": label,
+        "shortLabel": short,
+        "icon": prize.get("icon", ""),
+        "kind": kind if terms is not None else None,
+        "active": bool(prize.get("active")),
+        "minOrder": terms.min_order if terms else None,
+        "minItems": terms.min_items if terms else None,
+        "amount": terms.amount if terms and terms.kind not in DELIVERY_COUPONS else None,
+    }
+
+
+def coupon_eligible(terms: CouponTerms, cart: Cart, delivery: str) -> bool:
+    if terms.kind in DELIVERY_COUPONS and delivery != "Room Delivery":
+        return False
+    if terms.kind == "premium5" and cart.premium_count < PREMIUM_ITEMS:
+        return False
+    return cart.subtotal >= terms.min_order * 100 and cart.item_count >= terms.min_items
 
 
 @dataclass
@@ -158,14 +249,14 @@ def gift_text(rupees: int) -> str:
     return f"₹{rupees} chocolate (free)"
 
 
-def coupon_value(kind: str, delivery_fee: int = ROOM_DELIVERY_FEE_PAISE) -> int:
+def coupon_value(terms: CouponTerms, delivery_fee: int = ROOM_DELIVERY_FEE_PAISE) -> int:
     """Paise off for a coupon. The delivery coupons follow the delivery fee: free60 is the whole fee
     ("FREE Delivery"), halfDelivery half of it."""
-    if kind == "free60":
+    if terms.kind == "free60":
         return delivery_fee
-    if kind == "halfDelivery":
+    if terms.kind == "halfDelivery":
         return delivery_fee // 2
-    return COUPON_VALUES[kind] * 100
+    return terms.amount * 100
 
 
 def best_deal(
@@ -216,13 +307,16 @@ def best_deal(
         gift = amount("tier50", "gift", TIER50_GIFT)
         candidates.append((gift * 100, Deal(kind="tier50", label=title("tier50", "₹50+ Offer"), freebies=[gift_text(gift)] if gift else [])))
 
-    if coupon and coupon.kind and coupon_eligible(coupon.kind, cart, delivery):
-        if coupon.kind == "freeSnack100":
-            savings, deal = FREE_PICK_VALUE * 100, Deal(kind="coupon", label=coupon.label, coupon=coupon, free_pick=True)
+    terms = spin_terms(coupon) if coupon else None
+    if coupon and terms is not None and coupon_eligible(terms, cart, delivery):
+        if terms.kind == "freeSnack100":
+            savings = terms.amount * 100
+            deal = Deal(kind="coupon", label=coupon.label, coupon=coupon, free_pick=True, pick_value=terms.amount, pick_up_to=terms.pick_up_to)
         else:
-            savings = min(coupon_value(coupon.kind, delivery_fee), cart.subtotal + fee)
+            savings = min(coupon_value(terms, delivery_fee), cart.subtotal + fee)
             deal = Deal(kind="coupon", label=coupon.label, discount=savings, coupon=coupon)
-        if row.coupon_rule == "coupon":
+        # A coupon that would save nothing here (free room delivery when delivery is already free) is kept.
+        if savings > 0 and row.coupon_rule == "coupon":
             return deal
         candidates.append((savings, deal))
 
@@ -283,7 +377,8 @@ def current_coupon(db: Session, user: User) -> Spin | None:
 
 
 def coupon_out(spin: Spin | None) -> CouponOut | None:
-    if spin is None or spin.kind is None or spin.expires_at is None:
+    terms = spin_terms(spin) if spin is not None else None
+    if spin is None or terms is None or spin.expires_at is None:
         return None
     return CouponOut(
         code=spin.code,
@@ -292,6 +387,10 @@ def coupon_out(spin: Spin | None) -> CouponOut | None:
         icon=spin.icon,
         kind=spin.kind,  # type: ignore[arg-type]
         expires_at=to_ms(spin.expires_at),
+        min_order=terms.min_order,
+        min_items=terms.min_items,
+        amount=terms.amount,
+        pick_up_to=terms.pick_up_to,
     )
 
 

@@ -236,12 +236,19 @@ class DailyOffer(CamelModel):
 
 
 class WheelPrize(CamelModel):
+    """A wheel slice. kind is what it gives (None: Better Luck; three5 and four10 are both "₹ off"); the
+    cart it needs and the amount are the shop's (see services.coupon_terms). The label and short label
+    are made from those when saved (services.prize_text), so what a slice says is what it gives."""
+
     code: str = Field(min_length=1, max_length=20)
     label: str = Field(min_length=1, max_length=80)
     short_label: str = Field(max_length=80)
     icon: str = Field(max_length=16)
     kind: CouponKind | None
     active: bool
+    min_order: int | None = Field(default=None, ge=0, le=5000)  # ₹, items subtotal
+    min_items: int | None = Field(default=None, ge=0, le=50)
+    amount: int | None = Field(default=None, ge=1, le=500)  # ₹ off, or the free snack's value (not delivery)
 
 
 class Promotions(CamelModel):
@@ -249,6 +256,12 @@ class Promotions(CamelModel):
     daily_offers: list[DailyOffer] = Field(max_length=5)
     wheel_prizes: list[WheelPrize] = Field(min_length=2, max_length=16)
     coupon_rule: CouponRule = "best"
+    # Customers see the wheel and can spin. Saving offers doesn't change it: PUT /admin/wheel does.
+    wheel_enabled: bool | None = None
+
+
+class WheelSwitch(CamelModel):
+    enabled: bool
 
 
 class SoldItem(CamelModel):
@@ -450,6 +463,11 @@ class CouponOut(CamelModel):
     icon: str
     kind: CouponKind
     expires_at: int  # epoch milliseconds
+    # Its terms (see services.CouponTerms): the cart it needs, and what it gives.
+    min_order: int  # ₹, items subtotal
+    min_items: int
+    amount: int  # ₹ off; freeSnack100: the free item's value; 0 for the delivery coupons
+    pick_up_to: int  # freeSnack100: the free item's MRP up to ₹ (else 0)
 
 
 class SpinStatus(CamelModel):

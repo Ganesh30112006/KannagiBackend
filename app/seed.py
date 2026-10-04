@@ -52,7 +52,16 @@ DEFAULT_WHEEL_PRIZES = [
 
 
 def seed(db: Session) -> None:
+    from .services import canonical_prize  # services reads this module's defaults
+
     row = db.get(MartSettings, 1)
+    if row is not None:
+        # Each slice with its amounts written out and its text made from them (shops from before slices
+        # had amounts: their text could say something other than what the slice gave).
+        prizes = [canonical_prize(prize) for prize in row.wheel_prizes or []]
+        if prizes and prizes != row.wheel_prizes:
+            row.wheel_prizes = prizes
+            sync.bump(db, sync.PROMOTIONS)
     if row is not None and row.launch_message == OLD_DEMO_LAUNCH_MESSAGE:
         row.launch_message = DEFAULT_LAUNCH_MESSAGE
         sync.bump(db, sync.PROMOTIONS)  # open pages drop it on their next sync
@@ -65,7 +74,7 @@ def seed(db: Session) -> None:
                 id=1,
                 launch_message=DEFAULT_LAUNCH_MESSAGE,
                 daily_offers=DEFAULT_DAILY_OFFERS,
-                wheel_prizes=DEFAULT_WHEEL_PRIZES,
+                wheel_prizes=[canonical_prize(prize) for prize in DEFAULT_WHEEL_PRIZES],
                 store_override="auto",
                 coupon_rule="best",
             )

@@ -12,7 +12,7 @@ from ..database import get_db
 from ..models import Spin, User, utcnow
 from ..schemas import SpinResult, SpinStatus, WheelPrize
 from ..security import current_user
-from ..services import COUPON_HOURS, active_prizes, coupon_out, current_coupon, get_settings, shop_date
+from ..services import COUPON_HOURS, active_prizes, coupon_out, current_coupon, get_settings, prize_terms, shop_date
 
 router = APIRouter(prefix="/spin", tags=["spin"])
 
@@ -28,20 +28,28 @@ def spin_status(user: User = Depends(current_user), db: Session = Depends(get_db
 
 @router.post("", response_model=SpinResult)
 def spin(user: User = Depends(current_user), db: Session = Depends(get_db)) -> SpinResult:
+    settings_row = get_settings(db)
+    if not settings_row.wheel_enabled:
+        raise HTTPException(status.HTTP_409_CONFLICT, "The spin wheel is switched off right now. A coupon you already won still works.")
     if _spun_today(db, user):
         raise HTTPException(status.HTTP_409_CONFLICT, "You already spun today. Come back tomorrow! 💫")
-    prizes = active_prizes(get_settings(db))
+    prizes = active_prizes(settings_row)
     index = secrets.randbelow(len(prizes))
     prize = prizes[index]
-    # A new spin replaces any previous coupon, including a "Better Luck" result.
+    terms = prize_terms(prize)
+    # A new spin replaces any previous coupon, including a "Better Luck" result. A win keeps the slice's
+    # terms as they are now, whatever the shop changes later.
     row = Spin(
         user_id=user.id,
         spun_on=shop_date(),
         code=prize["code"],
-        kind=prize.get("kind"),
+        kind=terms.kind if terms else None,
         label=prize["label"],
         icon=prize.get("icon", ""),
-        expires_at=utcnow() + timedelta(hours=COUPON_HOURS) if prize.get("kind") else None,
+        min_order=terms.min_order if terms else None,
+        min_items=terms.min_items if terms else None,
+        amount=terms.amount if terms else None,
+        expires_at=utcnow() + timedelta(hours=COUPON_HOURS) if terms else None,
     )
     db.add(row)
     try:

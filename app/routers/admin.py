@@ -28,12 +28,24 @@ from ..schemas import (
     SoldItem,
     StoreStatus,
     StoreUpdate,
+    WheelSwitch,
 )
 from ..security import shopkeeper
 from ..images import ImageStoreError, delete_image, store_image
-from ..services import cart_summary, get_settings, order_out, paise, product_out, rupees, sale_price, store_online, to_ms
+from ..services import (
+    canonical_prize,
+    cart_summary,
+    get_settings,
+    order_out,
+    paise,
+    product_out,
+    rupees,
+    sale_price,
+    store_online,
+    to_ms,
+)
 from .orders import _take
-from .shop import clear_wishes
+from .shop import clear_wishes, promotions
 
 router = APIRouter(prefix="/admin", tags=["admin"], dependencies=[Depends(shopkeeper)])
 
@@ -453,11 +465,24 @@ def save_promotions(body: Promotions, db: Session = Depends(get_db)) -> Promotio
         # A page from before the loyalty card existed doesn't send it: keep it as it is.
         offers += [offer for offer in row.daily_offers if offer.get("id") == "loyalty"]
     row.daily_offers = offers
-    row.wheel_prizes = [prize.model_dump(by_alias=True) for prize in body.wheel_prizes]
+    # What each slice says is made from what it gives (services.prize_text), whatever text was sent.
+    row.wheel_prizes = [canonical_prize(prize.model_dump(by_alias=True)) for prize in body.wheel_prizes]
     row.coupon_rule = body.coupon_rule
     sync.bump(db, sync.PROMOTIONS)
     db.commit()
-    return body
+    return promotions(db)
+
+
+@router.put("/wheel", response_model=Promotions)
+def switch_wheel(body: WheelSwitch, db: Session = Depends(get_db)) -> Promotions:
+    """Spin & Win on or off for customers, at once (not with the offers' Save, so unsaved edits there
+    don't go with it). Coupons already won keep working until they expire."""
+    row = get_settings(db)
+    if row.wheel_enabled != body.enabled:
+        row.wheel_enabled = body.enabled
+        sync.bump(db, sync.PROMOTIONS)
+        db.commit()
+    return promotions(db)
 
 
 @router.put("/store", response_model=StoreStatus)

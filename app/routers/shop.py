@@ -75,6 +75,7 @@ def promotions(db: Session = Depends(get_db)) -> Promotions:
             "dailyOffers": row.daily_offers,
             "wheelPrizes": row.wheel_prizes,
             "couponRule": row.coupon_rule,
+            "wheelEnabled": bool(row.wheel_enabled),
         }
     )
 

@@ -189,6 +189,7 @@ class MartSettings(Base):
     wheel_prizes: Mapped[list[dict]] = mapped_column(JSON)
     store_override: Mapped[str] = mapped_column(String(10), default="auto")
     coupon_rule: Mapped[str] = mapped_column(String(10), default="best")
+    wheel_enabled: Mapped[bool] = mapped_column(Boolean, default=True)  # customers can spin
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
 
 
@@ -217,6 +218,10 @@ class Spin(Base):
     kind: Mapped[str | None] = mapped_column(String(20), nullable=True)
     label: Mapped[str] = mapped_column(String(80))
     icon: Mapped[str] = mapped_column(String(16))
+    # The won slice's terms at the time (services.coupon_terms); empty on coupons from before they existed.
+    min_order: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    min_items: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    amount: Mapped[int | None] = mapped_column(Integer, nullable=True)
     expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     used_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
