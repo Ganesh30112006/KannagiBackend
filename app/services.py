@@ -15,8 +15,9 @@ from .security import has_shop_access, is_site_admin
 from .seed import DEFAULT_WHEEL_PRIZES
 from .staff import is_owner
 
-# Defaults; the site admin can change the markup, delivery fee and hours at /admin (see site.py).
-MARKUP = 5  # every item sells at MRP + ₹5 (eggs: + ₹5 once per bundle)
+# Defaults; the site admin can change the delivery fee and hours at /admin (see site.py), and the shop
+# each item's markup on its card.
+MARKUP = 5  # a new item sells at MRP + ₹5 (eggs: + ₹5 once per bundle)
 ROOM_DELIVERY_FEE = 10
 PREMIUM_PRICE = 45
 COUPON_HOURS = 48
@@ -100,16 +101,21 @@ def is_egg(name: str) -> bool:
     return name.strip().lower() == "eggs"
 
 
-def sale_price(product: Product, markup: int = MARKUP) -> float:
-    """Price per item: MRP + markup (₹5), except eggs, which are MRP each (+ markup once per order)."""
-    return product.purchase_price if is_egg(product.name) else product.purchase_price + markup
+def markup_of(product: Product) -> int:
+    """The item's own markup in rupees (set on its card)."""
+    return MARKUP if product.markup is None else product.markup
 
 
-def line_total(product: Product, qty: int, markup: int = MARKUP) -> int:
+def sale_price(product: Product) -> float:
+    """Price per item: MRP + its markup, except eggs, which are MRP each (+ their markup once per order)."""
+    return product.purchase_price if is_egg(product.name) else product.purchase_price + markup_of(product)
+
+
+def line_total(product: Product, qty: int) -> int:
     """In paise."""
     if is_egg(product.name):
-        return paise(product.purchase_price) * qty + (markup * 100 if qty > 0 else 0)
-    return (paise(product.purchase_price) + markup * 100) * qty
+        return paise(product.purchase_price) * qty + (markup_of(product) * 100 if qty > 0 else 0)
+    return (paise(product.purchase_price) + markup_of(product) * 100) * qty
 
 
 @dataclass
@@ -119,11 +125,11 @@ class Cart:
     premium_count: int
 
 
-def cart_summary(lines: list[tuple[Product, int]], markup: int = MARKUP) -> Cart:
+def cart_summary(lines: list[tuple[Product, int]]) -> Cart:
     return Cart(
-        subtotal=sum(line_total(product, qty, markup) for product, qty in lines),
+        subtotal=sum(line_total(product, qty) for product, qty in lines),
         item_count=sum(qty for _, qty in lines),
-        premium_count=sum(qty for product, qty in lines if paise(sale_price(product, markup)) >= PREMIUM_PRICE * 100),
+        premium_count=sum(qty for product, qty in lines if paise(sale_price(product)) >= PREMIUM_PRICE * 100),
     )
 
 
@@ -417,6 +423,7 @@ def product_out(product: Product) -> ProductOut:
         name=product.name,
         emoji=product.emoji,
         mrp=product.purchase_price,
+        markup=markup_of(product),
         stock=product.stock,
         threshold=product.threshold,
         category=product.category,

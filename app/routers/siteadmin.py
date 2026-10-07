@@ -61,7 +61,7 @@ from ..schemas import (
     WishIn,
 )
 from ..security import create_token, hash_password, site_admin, verify_password
-from ..services import get_settings, is_egg, paise, rupees, sale_price, shop_now, store_online, to_ms, user_out
+from ..services import MARKUP, get_settings, is_egg, markup_of, paise, rupees, sale_price, shop_now, store_online, to_ms, user_out
 from ..staff import is_owner
 from .admin import _with_customers
 from .shop import clear_wishes
@@ -184,7 +184,6 @@ def investment(period: InvestmentPeriod = "month", db: Session = Depends(get_db)
     )
     since = db.scalar(select(func.min(StockEntry.created_at)))
 
-    markup = site.values(db).markup
     in_stock = list(db.scalars(select(Product).where(Product.active, Product.stock > 0)))
     left_items = sorted(
         (
@@ -219,7 +218,7 @@ def investment(period: InvestmentPeriod = "month", db: Session = Depends(get_db)
             items=len(in_stock),
             units=sum(product.stock for product in in_stock),
             value=rupees(sum(paise(product.purchase_price) * product.stock for product in in_stock)),
-            sale_value=rupees(sum(paise(sale_price(product, markup)) * product.stock for product in in_stock)),
+            sale_value=rupees(sum(paise(sale_price(product)) * product.stock for product in in_stock)),
         ),
         left_items=left_items,
     )
@@ -333,6 +332,11 @@ def profit(period: InvestmentPeriod = "month", db: Session = Depends(get_db)) ->
         for product in db.scalars(select(Product).where(Product.name.in_(names)).order_by(Product.active, Product.id))
     } if names else {}
 
+    def egg_markup(name: str) -> int:
+        """In paise: the eggs' markup, as on their card (a sale doesn't record it)."""
+        eggs = catalog.get(name)
+        return (MARKUP if eggs is None else markup_of(eggs)) * 100
+
     def gifts_cost(freebies) -> int:
         """At the price of the gift: a free pick at its item's MRP; "₹5 chocolate (free)" at ₹5."""
         cost = 0
@@ -351,12 +355,10 @@ def profit(period: InvestmentPeriod = "month", db: Session = Depends(get_db)) ->
 
     def items_value(lines: list[Line]) -> tuple[int, int, int]:
         """A sale's items at the shop's prices, what they cost and how many, also added to per_item. Eggs
-        are MRP each plus the markup once; the markup is what its other items show (price - MRP), or
-        today's for a sale of eggs alone."""
-        markup = next((price - cost for name, _, cost, price in lines if not is_egg(name)), shop.markup * 100)
+        are MRP each plus their markup once (the eggs' own markup: the sale doesn't record it)."""
         value = cost_total = units = 0
         for name, qty, cost, price in lines:
-            line_value = price * qty + (markup if is_egg(name) and qty > 0 else 0)
+            line_value = price * qty + (egg_markup(name) if is_egg(name) and qty > 0 else 0)
             item = per_item.setdefault(name, [0, 0, 0])
             item[0] += qty
             item[1] += line_value
@@ -419,7 +421,7 @@ def profit(period: InvestmentPeriod = "month", db: Session = Depends(get_db)) ->
     sold = sorted((item_out(name, *figures) for name, figures in per_item.items()), key=lambda item: (-item.profit, item.name))
     in_stock = list(db.scalars(select(Product).where(Product.active, Product.stock > 0)))
     left = [
-        (product, paise(sale_price(product, shop.markup)) * product.stock, paise(product.purchase_price) * product.stock)
+        (product, paise(sale_price(product)) * product.stock, paise(product.purchase_price) * product.stock)
         for product in in_stock
     ]
     stock_items = sorted(
@@ -471,6 +473,8 @@ def get_site_settings(db: Session = Depends(get_db)) -> SiteAdminOut:
 @router.put("/settings", response_model=SiteAdminOut)
 def save_site_settings(body: SiteValues, db: Session = Depends(get_db)) -> SiteAdminOut:
     """Open pages pick the new details up within seconds (next sync)."""
+    if "markup" not in body.model_fields_set:
+        body.markup = site.values(db).markup  # not on the form any more: keep what's stored
     site.save(db, body)
     db.commit()
     return _admin_out(db)

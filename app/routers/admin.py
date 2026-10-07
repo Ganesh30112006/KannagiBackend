@@ -135,6 +135,7 @@ def create_product(body: ProductCreate, background: BackgroundTasks, user: User 
         name=body.name,
         emoji=body.emoji or "🛍️",
         purchase_price=body.mrp,
+        markup=body.markup,
         stock=body.stock,
         threshold=body.threshold,
         category=body.category or "Snacks",
@@ -185,6 +186,8 @@ def _apply_update(db: Session, product_id: int, body: ProductUpdate, image_url: 
         product.name = body.name
     if "mrp" in fields and body.mrp is not None:
         product.purchase_price = body.mrp
+    if "markup" in fields and body.markup is not None:
+        product.markup = body.markup
     if "stock" in fields and body.stock is not None:
         product.stock = body.stock
     if body.stock_delta:
@@ -336,9 +339,8 @@ def record_manual_sale(body: ManualSaleIn, user: User = Depends(shopkeeper), db:
                 status.HTTP_409_CONFLICT,
                 f"Only {left} {products[product_id].name} in stock. If there are more, correct the stock first.",
             )
-    shop = site.values(db)
     lines = [(products[product_id], qty) for product_id, qty in quantities.items()]
-    total = paise(body.amount) if body.amount is not None else cart_summary(lines, shop.markup).subtotal
+    total = paise(body.amount) if body.amount is not None else cart_summary(lines).subtotal
     sale = ManualSale(total=rupees(total), payment=body.payment, note=body.note or None, recorded_by=user.phone or user.email)
     for product, qty in lines:
         sale.items.append(
@@ -347,7 +349,7 @@ def record_manual_sale(body: ManualSaleIn, user: User = Depends(shopkeeper), db:
                 product_name=product.name,
                 quantity=qty,
                 purchase_price=product.purchase_price,
-                sale_price=sale_price(product, shop.markup),
+                sale_price=sale_price(product),
             )
         )
     db.add(sale)

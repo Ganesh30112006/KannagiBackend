@@ -21,7 +21,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from sqlalchemy import Engine, Integer, create_engine, func, insert, inspect, select, text
+from sqlalchemy import Engine, Integer, create_engine, func, insert, inspect, select, text, update
 
 from . import models
 from .config import BACKEND_DIR
@@ -89,6 +89,9 @@ def restore(backup_file: Path, target: Engine = engine) -> dict[str, int]:
             retire_shared_sign_ins(writer)  # a backup from the shared admin password and PIN days
         if "is_customer" not in saved_columns.get("users", set()):
             mark_customers(writer)  # a backup from when customers signed in with an email
+        if "markup" not in saved_columns.get("products", {"markup"}):
+            # A backup from when one markup was set for the whole shop: the next start gives each item that one.
+            writer.execute(update(models.Product.__table__).values(markup=None))
         if target.dialect.name == "postgresql":
             _reset_sequences(writer)
     return copied

@@ -63,6 +63,8 @@ ADDED_COLUMNS = {
         "wheel_enabled": "BOOLEAN NOT NULL DEFAULT TRUE",
     },
     "spins": {"min_order": "INTEGER", "min_items": "INTEGER", "amount": "INTEGER"},
+    # Each item's own markup (filled in on start-up from the shop-wide one it replaces: seed.py).
+    "products": {"markup": "INTEGER"},
     "orders": {
         "customer_name": "VARCHAR(100)",
         "customer_phone": "VARCHAR(20)",

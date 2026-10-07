@@ -1,10 +1,11 @@
 """The shop's settings rows, inserted on first start: the offers and spin-wheel prizes (switched on or
 off in the dashboard) and the shop details. No products: the shopkeeper adds the real ones."""
 
+from sqlalchemy import update
 from sqlalchemy.orm import Session
 
 from . import site, sync
-from .models import MartSettings
+from .models import MartSettings, Product
 
 # No launch banner until the shopkeeper writes one (an empty message shows nothing).
 DEFAULT_LAUNCH_MESSAGE = ""
@@ -80,4 +81,6 @@ def seed(db: Session) -> None:
             )
         )
     site.seed(db)
+    # Items from before each had its own markup get the shop-wide one they sold at, so no price changes.
+    db.execute(update(Product).where(Product.markup.is_(None)).values(markup=site.values(db).markup))
     db.commit()

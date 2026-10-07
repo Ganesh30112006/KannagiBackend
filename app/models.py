@@ -68,6 +68,9 @@ class Product(Base):
     name: Mapped[str] = mapped_column(String(80))
     emoji: Mapped[str] = mapped_column(String(16), default="🛍️")
     purchase_price: Mapped[float] = mapped_column(Float)
+    # Rupees added to its MRP for customers (eggs: once per order). Set on the item's card; None (items
+    # from before, until start-up fills them in) counts as the usual ₹5.
+    markup: Mapped[int | None] = mapped_column(Integer, nullable=True, default=5)
     stock: Mapped[int] = mapped_column(Integer, default=0)
     threshold: Mapped[int] = mapped_column(Integer, default=3)
     category: Mapped[str] = mapped_column(String(40), default="Snacks")

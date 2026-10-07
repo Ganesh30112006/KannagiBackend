@@ -139,7 +139,7 @@ def place_order(body: OrderIn, background: BackgroundTasks, user: User = Depends
         contact = (profile.full_name, profile.phone, profile.block, profile.room_number) if profile else (None, None, None, None)
 
     row = get_settings(db)
-    cart = cart_summary(lines, shop.markup)
+    cart = cart_summary(lines)
     delivery_fee = shop.delivery_fee * 100
     deal = best_deal(row, cart, body.delivery, not user.first_order_used, current_coupon(db, user), delivery_fee)
     fee = delivery_fee if body.delivery == "Room Delivery" else 0
@@ -200,7 +200,7 @@ def place_order(body: OrderIn, background: BackgroundTasks, user: User = Depends
                 product_name=product.name,
                 quantity=qty,
                 purchase_price=product.purchase_price,
-                sale_price=sale_price(product, shop.markup),
+                sale_price=sale_price(product),
             )
         )
     if deal.free_pick:

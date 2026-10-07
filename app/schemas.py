@@ -180,6 +180,7 @@ class ProductOut(CamelModel):
     name: str
     emoji: str
     mrp: float
+    markup: int  # rupees added to the MRP for customers (eggs: once per order)
     stock: int
     threshold: int
     category: str
@@ -192,6 +193,7 @@ class ProductOut(CamelModel):
 class ProductCreate(Stripped):
     name: str = Field(min_length=1, max_length=80)
     mrp: float = Field(gt=0, le=100_000)
+    markup: int = Field(default=5, ge=0, le=1000)  # rupees added to the MRP for customers
     stock: int = Field(ge=0, le=100_000)
     threshold: int = Field(default=3, ge=0, le=100_000)
     emoji: str = Field(default="🛍️", max_length=16)
@@ -206,6 +208,7 @@ class ProductUpdate(Stripped):
 
     name: str | None = Field(default=None, min_length=1, max_length=80)
     mrp: float | None = Field(default=None, gt=0, le=100_000)
+    markup: int | None = Field(default=None, ge=0, le=1000)
     stock: int | None = Field(default=None, ge=0, le=100_000)
     # Relative change applied atomically, so quick taps or two shopkeepers can't overwrite each other.
     stock_delta: int | None = Field(default=None, ge=-100_000, le=100_000)
@@ -650,7 +653,6 @@ class SitePublic(Stripped):
     pickup_enabled: bool = True
     room_delivery_enabled: bool = True
     delivery_fee: int = Field(default=10, ge=0, le=100)  # rupees, room delivery
-    markup: int = Field(default=5, ge=0, le=100)  # rupees added to each item's MRP (eggs: once per order)
 
     @field_validator("upi_id")
     @classmethod
@@ -689,6 +691,9 @@ class SiteValues(SitePublic):
     """Everything the site admin sets, including what only the server uses."""
 
     signups_open: bool = True
+    # The shop-wide markup from before each item had its own (Product.markup, set on its card): kept only
+    # to fill those in once (seed.py). Customers don't get it, and saving the settings keeps it.
+    markup: int = Field(default=5, ge=0, le=100)
 
 
 class SiteAdminOut(SiteValues):
