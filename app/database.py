@@ -61,6 +61,7 @@ ADDED_COLUMNS = {
     "mart_settings": {
         "coupon_rule": "VARCHAR(10) NOT NULL DEFAULT 'best'",
         "wheel_enabled": "BOOLEAN NOT NULL DEFAULT TRUE",
+        "offline_orders": "BOOLEAN NOT NULL DEFAULT TRUE",
     },
     "spins": {"min_order": "INTEGER", "min_items": "INTEGER", "amount": "INTEGER"},
     # Each item's own markup (filled in on start-up from the shop-wide one it replaces: seed.py).

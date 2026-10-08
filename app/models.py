@@ -193,6 +193,8 @@ class MartSettings(Base):
     store_override: Mapped[str] = mapped_column(String(10), default="auto")
     coupon_rule: Mapped[str] = mapped_column(String(10), default="best")
     wheel_enabled: Mapped[bool] = mapped_column(Boolean, default=True)  # customers can spin
+    # While the store is offline, customers can still order (on request). Off: they send a request instead.
+    offline_orders: Mapped[bool] = mapped_column(Boolean, default=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
 
 
@@ -206,6 +208,21 @@ class WishRequest(Base):
     item_key: Mapped[str] = mapped_column(String(60), index=True)
     label: Mapped[str] = mapped_column(String(60))
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class OrderRequest(Base):
+    """While the store is offline and not taking orders, a customer can ask the shop for what's in her
+    cart. Shopkeepers and admins see it on the dashboard (and get an alert), get in touch, and mark it
+    done. No stock is taken. One per customer: sending again replaces it; ordering removes it."""
+
+    __tablename__ = "order_requests"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), unique=True)
+    items: Mapped[list[dict]] = mapped_column(JSON)  # [{"productId", "name", "qty"}], as sent
+    delivery: Mapped[str] = mapped_column(String(20))
+    note: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
 
 
 class Spin(Base):

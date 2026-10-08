@@ -433,10 +433,17 @@ class Profit(CamelModel):
 class StoreStatus(CamelModel):
     override: StoreOverride
     online: bool
+    # While offline: True, orders go through on request; False, customers send a request instead.
+    offline_orders: bool = True
 
 
 class StoreUpdate(CamelModel):
     override: StoreOverride
+
+
+class OfflineOrdersSwitch(CamelModel):
+    enabled: bool
+
 
 
 # --- wishes ---
@@ -770,3 +777,29 @@ class AdminOverview(CamelModel):
     awaiting_payment: int
     store_online: bool
     reset_requests: int  # customers waiting for a new password
+
+
+# --- order requests (while the shop isn't taking orders; see routers/requests.py) ---
+
+
+class OrderRequestIn(Stripped):
+    """What's in her cart, sent to the shop while it isn't taking orders."""
+
+    items: list[OrderItemIn] = Field(min_length=1, max_length=50)
+    delivery: Delivery
+    note: str | None = Field(default=None, max_length=200)
+
+
+class RequestItem(CamelModel):
+    product_id: int
+    name: str
+    qty: int
+
+
+class OrderRequestOut(CamelModel):
+    id: int
+    created_at: int  # epoch milliseconds
+    items: list[RequestItem]
+    delivery: Delivery
+    note: str | None = None
+    customer: OrderCustomer | None = None  # for shopkeepers and admins only

@@ -6,7 +6,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
 
 from .config import settings
-from .routers import admin, alerts, auth, orders, profile, session, shop, siteadmin, spin
+from .routers import admin, alerts, auth, orders, profile, requests, session, shop, siteadmin, spin
 from .startup import prepare_database
 
 PUBLIC_PATHS = {"/api/health"}
@@ -70,7 +70,7 @@ async def invalid_request(_request: Request, error: RequestValidationError) -> J
     return JSONResponse({"detail": detail}, status_code=422)
 
 
-for module in (auth, profile, shop, spin, orders, admin, siteadmin, session, alerts):
+for module in (auth, profile, shop, spin, orders, requests, admin, siteadmin, session, alerts):
     app.include_router(module.router, prefix="/api")
 
 

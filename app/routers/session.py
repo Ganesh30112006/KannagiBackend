@@ -11,8 +11,9 @@ from ..database import get_db
 from ..models import User
 from ..security import current_user, has_shop_access
 from ..services import get_settings, loyalty, user_out
-from .admin import MANUAL_SALES_SHOWN, recent_manual_sales, recent_orders, sales_summary
+from .admin import MANUAL_SALES_SHOWN, order_requests, recent_manual_sales, recent_orders, sales_summary
 from .orders import my_orders
+from .requests import my_request
 from .profile import get_profile
 from .shop import list_products, list_wishes, promotions, store_status
 from .spin import spin_status
@@ -40,6 +41,7 @@ def bootstrap(user: User = Depends(current_user), db: Session = Depends(get_db))
         "user": _json(user_out(user)),
         "products": _json(list_products(user=user, db=db), drop_none=True),
         "orders": _json(my_orders(user, db), drop_none=True),
+        "myRequest": _json(my_request(user, db), drop_none=True),
         "profile": _json(get_profile(user, db)),
         "promotions": _json(promotions(db)),
         "store": _json(store_status(db)),
@@ -88,6 +90,7 @@ def sync_changes(
         result["wishes"] = _json(list_wishes(db))
     if orders != revs[sync.ORDERS]:
         result["orders"] = _json(my_orders(user, db), drop_none=True)
+        result["myRequest"] = _json(my_request(user, db), drop_none=True)
         result["firstOrderAvailable"] = not user.first_order_used
     if orders != revs[sync.ORDERS] or promotions_rev != revs[sync.PROMOTIONS]:
         # Her stamps move when an order is handed over; the card's terms when the offers change.
@@ -97,6 +100,7 @@ def sync_changes(
             "orders": _json(recent_orders(limit=ADMIN_ORDERS, db=db), drop_none=True),
             "summary": _json(sales_summary(db)),
             "manualSales": _json(recent_manual_sales(limit=MANUAL_SALES_SHOWN, db=db), drop_none=True),
+            "requests": _json(order_requests(db=db), drop_none=True),
         }
     return result
 

@@ -1,10 +1,10 @@
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
-from sqlalchemy import select, update
+from sqlalchemy import delete, select, update
 from sqlalchemy.orm import Session, selectinload
 
 from .. import alerts, site, sync
 from ..database import get_db, takes_turns
-from ..models import Order, OrderItem, Product, Profile, Spin, User, utcnow
+from ..models import Order, OrderItem, OrderRequest, Product, Profile, Spin, User, utcnow
 from ..schemas import IdPath, OrderIn, OrderOut, UtrIn
 from ..security import current_user
 from ..services import (
@@ -85,6 +85,9 @@ def place_order(body: OrderIn, background: BackgroundTasks, user: User = Depends
     if db.scalar(her) is None:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Please sign in again.")
     shop = site.values(db)
+    row = get_settings(db)
+    if not row.offline_orders and not store_online(row, shop.open_hour, shop.close_hour):
+        raise _conflict("The store is offline and isn't taking orders right now. You can send the shop a request for these items instead.")
     turned_off = {
         "UPI": not shop.upi_enabled,
         "Pay on Delivery": not shop.cash_enabled,
@@ -138,7 +141,6 @@ def place_order(body: OrderIn, background: BackgroundTasks, user: User = Depends
         profile = db.get(Profile, user.id)
         contact = (profile.full_name, profile.phone, profile.block, profile.room_number) if profile else (None, None, None, None)
 
-    row = get_settings(db)
     cart = cart_summary(lines)
     delivery_fee = shop.delivery_fee * 100
     deal = best_deal(row, cart, body.delivery, not user.first_order_used, current_coupon(db, user), delivery_fee)
@@ -224,6 +226,7 @@ def place_order(body: OrderIn, background: BackgroundTasks, user: User = Depends
         db.rollback()
         raise _conflict("Your first-order discount was already used on another order. Please check your cart again.")
     db.add(order)
+    db.execute(delete(OrderRequest).where(OrderRequest.user_id == user.id))  # she ordered what she asked for
     sync.bump(db, sync.ORDERS, sync.CATALOG)
     db.commit()
     # The shopkeepers' phones and laptops with order alerts on get one, after the order is saved.

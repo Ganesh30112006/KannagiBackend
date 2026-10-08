@@ -19,7 +19,7 @@ from sqlalchemy.orm import Session, selectinload
 from . import site, webpush
 from .config import settings
 from .database import SessionLocal
-from .models import AlertDevice, Order, Product, User, utcnow
+from .models import AlertDevice, Order, OrderRequest, Product, Profile, User, utcnow
 from .schemas import AlertTestOut
 from .security import _password_version
 from .services import format_money, paise, shop_now
@@ -153,6 +153,33 @@ def new_order(order_id: int) -> None:
             _send(db, key, AlertDevice.role.in_(STAFF), lambda _: message, ORDER_ALERT_TTL, f"Order alert for {order_label(order_id)}")
     except Exception:
         logger.exception("Order alerts for order %s failed", order_label(order_id))
+
+
+def request_message(request: OrderRequest, profile: Profile | None) -> dict[str, str]:
+    count = sum(item["qty"] for item in request.items)
+    who = " ".join(((profile.full_name if profile else "") or "").split())[:40] or "A customer"
+    place = f"Block {profile.block}, Room {profile.room_number}" if profile and profile.room_number else request.delivery
+    return {
+        "title": f"Order request · {count} item{'' if count == 1 else 's'}",
+        "body": f"{who} · {place}\nThe store is offline and not taking orders: she asked for these. Open the dashboard to see them.",
+        "tag": f"request-{request.id}",
+    }
+
+
+def new_request(request_id: int) -> None:
+    """A customer's request while the shop isn't taking orders goes to every shopkeeper's and admin's device."""
+    try:
+        key = signing_key()
+        if key is None:
+            return
+        with SessionLocal() as db:
+            request = db.get(OrderRequest, request_id)
+            if request is None:
+                return
+            message = request_message(request, db.get(Profile, request.user_id))
+            _send(db, key, AlertDevice.role.in_(STAFF), lambda _: message, ORDER_ALERT_TTL, f"Request alert {request_id}")
+    except Exception:
+        logger.exception("Request alerts for request %s failed", request_id)
 
 
 # --- customers ---

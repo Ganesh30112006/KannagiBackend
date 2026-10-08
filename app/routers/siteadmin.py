@@ -27,6 +27,7 @@ from ..models import (
     OrderItem,
     Product,
     Profile,
+    OrderRequest,
     ResetRequest,
     Spin,
     StockEntry,
@@ -688,7 +689,7 @@ def delete_user(user_id: str, db: Session = Depends(get_db), admin: User = Depen
             .values(customer_name=profile.full_name, customer_phone=profile.phone, customer_block=profile.block, customer_room=profile.room_number)
         )
     voted = db.scalar(select(func.count()).select_from(WishRequest).where(WishRequest.user_id == user.id))
-    for model in (Profile, WishRequest, Spin, ResetRequest, AlertDevice):
+    for model in (Profile, WishRequest, Spin, ResetRequest, AlertDevice, OrderRequest):
         db.execute(delete(model).where(model.user_id == user.id))
     if db.scalar(select(Order.id).where(Order.user_id == user.id).limit(1)) is None:
         db.delete(user)

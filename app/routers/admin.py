@@ -4,12 +4,12 @@ import re
 from datetime import timedelta
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Response, status
-from sqlalchemy import and_, func, or_, select, update
+from sqlalchemy import and_, delete, func, or_, select, update
 from sqlalchemy.orm import Session, selectinload
 
-from .. import alerts, site, sync
+from .. import alerts, sync
 from ..database import get_db, takes_turns
-from ..models import ManualSale, ManualSaleItem, Order, OrderItem, Product, Profile, StockEntry, User, utcnow
+from ..models import ManualSale, ManualSaleItem, Order, OrderItem, OrderRequest, Product, Profile, StockEntry, User, utcnow
 from ..schemas import (
     AdminOrderOut,
     FulfilIn,
@@ -17,8 +17,10 @@ from ..schemas import (
     ManualSaleIn,
     ManualSaleItemOut,
     ManualSaleOut,
+    OfflineOrdersSwitch,
     PaymentIn,
     OrderCustomer,
+    OrderRequestOut,
     ProductCreate,
     ProductOut,
     ProductUpdate,
@@ -41,11 +43,11 @@ from ..services import (
     product_out,
     rupees,
     sale_price,
-    store_online,
     to_ms,
 )
 from .orders import _take
-from .shop import clear_wishes, promotions
+from .requests import with_customers as requests_with_customers
+from .shop import clear_wishes, promotions, store_status
 
 router = APIRouter(prefix="/admin", tags=["admin"], dependencies=[Depends(shopkeeper)])
 
@@ -492,5 +494,30 @@ def set_store_status(body: StoreUpdate, db: Session = Depends(get_db)) -> StoreS
     row = get_settings(db)
     row.store_override = body.override
     db.commit()
-    shop = site.values(db)
-    return StoreStatus(override=body.override, online=store_online(row, shop.open_hour, shop.close_hour))
+    return store_status(db)
+
+
+@router.put("/offline-orders", response_model=StoreStatus)
+def switch_offline_orders(body: OfflineOrdersSwitch, db: Session = Depends(get_db)) -> StoreStatus:
+    """While the store is offline: take orders (on request), or not (customers send a request instead).
+    Orders already placed stay as they are."""
+    row = get_settings(db)
+    row.offline_orders = body.enabled
+    db.commit()
+    return store_status(db)
+
+
+@router.get("/order-requests", response_model=list[OrderRequestOut], response_model_exclude_none=True)
+def order_requests(db: Session = Depends(get_db)) -> list[OrderRequestOut]:
+    """Customers' requests while the shop wasn't taking orders, newest first."""
+    requests = list(db.scalars(select(OrderRequest).order_by(OrderRequest.created_at.desc(), OrderRequest.id.desc()).limit(200)))
+    return requests_with_customers(db, requests)
+
+
+@router.delete("/order-requests/{request_id}", status_code=status.HTTP_204_NO_CONTENT)
+def finish_order_request(request_id: IdPath, db: Session = Depends(get_db)) -> Response:
+    """Done (the shop got in touch). Already done by someone else is fine too."""
+    if db.execute(delete(OrderRequest).where(OrderRequest.id == request_id)).rowcount:
+        sync.bump(db, sync.ORDERS)
+    db.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)

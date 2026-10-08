@@ -63,7 +63,7 @@ def list_products(user: User = Depends(current_user), db: Session = Depends(get_
 def store_status(db: Session = Depends(get_db)) -> StoreStatus:
     row, shop = get_settings(db), site.values(db)
     online = store_online(row, shop.open_hour, shop.close_hour)
-    return StoreStatus(override=row.store_override, online=online)  # type: ignore[arg-type]
+    return StoreStatus(override=row.store_override, online=online, offline_orders=bool(row.offline_orders))  # type: ignore[arg-type]
 
 
 @router.get("/promotions", response_model=Promotions)
