@@ -13,6 +13,7 @@ from ..models import ManualSale, ManualSaleItem, Order, OrderItem, OrderRequest,
 from ..schemas import (
     AdminOrderOut,
     FulfilIn,
+    GiftIn,
     IdPath,
     ManualSaleIn,
     ManualSaleItemOut,
@@ -35,9 +36,12 @@ from ..schemas import (
 from ..security import shopkeeper
 from ..images import ImageStoreError, delete_image, store_image
 from ..services import (
+    GIFT,
+    GIVEN,
     canonical_prize,
     cart_summary,
     get_settings,
+    held_stock,
     order_out,
     paise,
     product_out,
@@ -163,9 +167,10 @@ def update_product(
     db: Session = Depends(get_db),
 ) -> ProductOut:
     """Stock added counts as stock bought, and stock taken off as taken off (see _log_stock)."""
-    if "stock" in body.model_fields_set and body.stock_delta:
-        # Setting and adjusting in one request is ambiguous; the website sends one or the other.
-        raise HTTPException(422, "Send either stock or stockDelta, not both.")
+    fields = body.model_fields_set
+    if sum(("stock" in fields and body.stock is not None, bool(body.stock_delta), "shelf" in fields and body.shelf is not None)) > 1:
+        # Setting and adjusting in one request is ambiguous; the website sends one of them.
+        raise HTTPException(422, "Send one of stock, stockDelta or shelf, not more.")
     _get_product(db, product_id)  # a missing item is refused before a photo is uploaded for it
     # Uploaded before the item is locked: an upload can take seconds, and orders for it would wait.
     image_url = _save_image(body.image) if "image" in body.model_fields_set else None
@@ -174,7 +179,7 @@ def update_product(
         _forget_image(db, background, old_image)
     if asked:
         background.add_task(alerts.back_in_stock, product.name, asked)
-    return product_out(product)
+    return product_out(product, held_stock(db).get(product.id, 0))
 
 
 @takes_turns
@@ -192,6 +197,10 @@ def _apply_update(db: Session, product_id: int, body: ProductUpdate, image_url: 
         product.markup = body.markup
     if "stock" in fields and body.stock is not None:
         product.stock = body.stock
+    if "shelf" in fields and body.shelf is not None:
+        # Read under the item's lock: an order for it now either went in before (and is counted here) or
+        # waits, and then takes its stock from what this leaves.
+        product.stock = max(0, body.shelf - held_stock(db).get(product.id, 0))
     if body.stock_delta:
         wanted = product.stock + body.stock_delta
         if wanted > MAX_STOCK:
@@ -402,7 +411,7 @@ def _set_fulfilled(db: Session, order_id: int, fulfilled: bool, payment_received
         order.payment_confirmed = True
     handed_over = fulfilled and not order.fulfilled
     order.fulfilled = fulfilled
-    sync.bump(db, sync.ORDERS)
+    sync.bump(db, sync.ORDERS, sync.CATALOG)  # the shop's items show what open orders hold
     db.commit()
     return _with_customers(db, [order])[0], handed_over
 
@@ -416,6 +425,55 @@ def fulfill_order(order_id: IdPath, background: BackgroundTasks, body: FulfilIn 
     if handed_over:
         background.add_task(alerts.order_update, order.id, "fulfilled")
     return order
+
+
+@router.post("/orders/{order_id}/gift", response_model=AdminOrderOut, response_model_exclude_none=True)
+@takes_turns
+def give_gift(order_id: IdPath, body: GiftIn, db: Session = Depends(get_db)) -> AdminOrderOut:
+    """Which item the shop gave for an order's free chocolate or snack: it comes off the stock (and goes
+    back if the order is cancelled), and Profit counts it at its MRP. productId null: none from stock
+    (one recorded before goes back on the shelf)."""
+    placed = db.get(Order, order_id)
+    if placed is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Order not found.")
+    # The lock order of placing an order: the customer, the order, then items by number.
+    db.execute(select(User.id).where(User.id == placed.user_id).with_for_update(key_share=True))
+    order = db.get(Order, order_id, options=[selectinload(Order.items)], with_for_update=True, populate_existing=True)
+    if order.cancelled:
+        raise HTTPException(status.HTTP_409_CONFLICT, "This order was cancelled.")
+    freebies = list(order.freebies or [])
+    if body.index >= len(freebies):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "That free item isn't on this order.")
+    text = freebies[body.index]
+    given, generic = GIVEN.fullmatch(text), GIFT.fullmatch(text)
+    if given is None and generic is None:
+        raise HTTPException(status.HTTP_409_CONFLICT, "That isn't a free chocolate or snack.")
+    if given is not None:
+        value, kind = given.group(2), given.group(3)
+    else:
+        value, kind = generic.group(1), "chocolate" if generic.group(2).startswith("chocolate") else "snack"
+    before = given.group(1) if given is not None else None
+    previous = db.scalar(select(Product.id).where(Product.name == before, Product.active).order_by(Product.id).limit(1)) if before else None
+    chosen = db.scalar(select(Product).where(Product.id == body.product_id, Product.active)) if body.product_id else None
+    if body.product_id and chosen is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "That item isn't on sale. Refresh the page.")
+    if chosen is not None and chosen.id == previous:
+        return _with_customers(db, [order])[0]  # already recorded
+    for product_id in sorted({previous, chosen.id if chosen else None} - {None}):
+        db.execute(select(Product.id).where(Product.id == product_id).with_for_update())
+        if product_id == previous:
+            db.execute(update(Product).where(Product.id == product_id).values(stock=Product.stock + 1))
+        elif not _take(db, product_id, 1):
+            db.rollback()
+            raise HTTPException(status.HTTP_409_CONFLICT, f"No {chosen.name} left in stock. Pick another item, or correct its stock first.")
+    if chosen is not None:
+        freebies[body.index] = f"{chosen.name} (free ₹{value} {kind})"
+    else:
+        freebies[body.index] = f"₹{value} chocolate (free)" if kind == "chocolate" else f"₹{value} free snack"
+    order.freebies = freebies
+    sync.bump(db, sync.ORDERS, sync.CATALOG)
+    db.commit()
+    return _with_customers(db, [order])[0]
 
 
 @router.post("/orders/{order_id}/payment", response_model=AdminOrderOut, response_model_exclude_none=True)

@@ -62,28 +62,19 @@ from ..schemas import (
     WishIn,
 )
 from ..security import create_token, hash_password, site_admin, verify_password
-from ..services import MARKUP, get_settings, is_egg, markup_of, paise, rupees, sale_price, shop_now, store_online, to_ms, user_out
+from ..services import MARKUP, get_settings, is_egg, markup_of, paise, picked_item, rupees, sale_price, shop_now, store_online, to_ms, user_out
 from ..staff import is_owner
 from .admin import _with_customers
 from .shop import clear_wishes
 
 router = APIRouter(prefix="/site-admin", tags=["site admin"], dependencies=[Depends(site_admin)])
 
-# How orders.py records a free item she picked, taken from stock: "Munch (free ₹10 pick)", or with her
-# loyalty reward "Munch (loyalty free ₹10 pick)".
-FREE_PICK = re.compile(r"(.+) \((?:loyalty )?free ₹\d+(?:\.\d+)? pick\)")
 ACTIVE = User.deleted_at.is_(None)  # deleted accounts kept only for their orders are left out
 MAIN_ADMIN = "the main admin is set in the server settings (ADMIN_MOBILE, ADMIN_PASSWORD)"
 
 
 def _admin_out(db: Session) -> SiteAdminOut:
     return SiteAdminOut(**site.values(db).model_dump(), photo_uploads_enabled=settings.cloudinary_url != "")
-
-
-def picked_item(freebie: object) -> str | None:
-    """The item's name, when an order's freebie is a free item she picked from stock."""
-    match = FREE_PICK.fullmatch(freebie) if isinstance(freebie, str) else None
-    return match.group(1) if match else None
 
 
 def _sign_out(user: User) -> None:

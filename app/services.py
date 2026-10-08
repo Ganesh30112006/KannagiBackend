@@ -5,11 +5,11 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import ROUND_HALF_UP, Decimal
 
-from sqlalchemy import select
+from sqlalchemy import and_, func, select
 from sqlalchemy.orm import Session
 
 from .config import settings
-from .models import MartSettings, Order, Product, Spin, User, utcnow
+from .models import MartSettings, Order, OrderItem, Product, Spin, User, utcnow
 from .schemas import CouponOut, LoyaltyOut, OrderItemOut, OrderOut, ProductOut, UserOut
 from .security import has_shop_access, is_site_admin
 from .seed import DEFAULT_WHEEL_PRIZES
@@ -417,8 +417,48 @@ def user_out(user: User) -> UserOut:
     )
 
 
-def product_out(product: Product) -> ProductOut:
+# A free item taken from stock, as an order lists it: one she picked ("Munch (free ₹10 pick)", with her
+# loyalty reward "Munch (loyalty free ₹10 pick)"), or the item the shop gave for a free chocolate or
+# snack ("5 Star Mini (free ₹5 chocolate)", "Munch (free ₹10 snack)").
+FREE_ITEM = re.compile(r"(.+) \((?:loyalty )?free ₹\d+(?:\.\d+)? (?:pick|chocolate|snack)\)")
+# A free chocolate or snack before the shop says which item it gave ("₹5 chocolate (free)", "₹10 free
+# snack"), and after ("5 Star Mini (free ₹5 chocolate)").
+GIFT = re.compile(r"₹(\d+(?:\.\d+)?) (chocolate \(free\)|free snack)")
+GIVEN = re.compile(r"(.+) \(free ₹(\d+(?:\.\d+)?) (chocolate|snack)\)")
+
+
+def picked_item(freebie: object) -> str | None:
+    """The item's name, when an order's freebie is an item taken from stock."""
+    match = FREE_ITEM.fullmatch(freebie) if isinstance(freebie, str) else None
+    return match.group(1) if match else None
+
+
+def held_stock(db: Session) -> dict[int, int]:
+    """Units of each item in orders not handed over yet (and not cancelled), free items included. They
+    came off the stock when ordered but are still on the shop's shelf."""
+    still_open = and_(Order.fulfilled.is_(False), Order.cancelled.is_(False))
+    lines = (
+        select(OrderItem.product_id, func.sum(OrderItem.quantity))
+        .join(Order, Order.id == OrderItem.order_id)
+        .where(still_open, OrderItem.product_id.is_not(None))
+        .group_by(OrderItem.product_id)
+    )
+    held = {product_id: int(quantity) for product_id, quantity in db.execute(lines).tuples()}
+    names = [name for freebies in db.scalars(select(Order.freebies).where(still_open)) for gift in freebies or [] if (name := picked_item(gift))]
+    if names:
+        # By name, as cancelling an order finds them to put them back: the first item on sale with it.
+        ids: dict[str, int] = {}
+        for product_id, name in db.execute(select(Product.id, Product.name).where(Product.name.in_(names), Product.active).order_by(Product.id)).tuples():
+            ids.setdefault(name, product_id)
+        for name in names:
+            if name in ids:
+                held[ids[name]] = held.get(ids[name], 0) + 1
+    return held
+
+
+def product_out(product: Product, held: int | None = None) -> ProductOut:
     return ProductOut(
+        held=held,
         id=product.id,
         name=product.name,
         emoji=product.emoji,

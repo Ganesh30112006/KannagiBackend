@@ -12,7 +12,7 @@ from ..database import get_db
 from ..models import Order, OrderItem, Product, User, WishRequest, utcnow
 from ..schemas import ProductOut, Promotions, StoreStatus, WishIn, WishOut, WishResult
 from ..security import current_user, has_shop_access
-from ..services import get_settings, product_out, store_online
+from ..services import get_settings, held_stock, product_out, store_online
 
 router = APIRouter(tags=["shop"], dependencies=[Depends(current_user)])
 
@@ -41,10 +41,13 @@ def _best_sellers(db: Session) -> set[int]:
 
 @router.get("/products", response_model=list[ProductOut], response_model_exclude_none=True)
 def list_products(user: User = Depends(current_user), db: Session = Depends(get_db)) -> list[ProductOut]:
-    """Customers see only what they can buy (in stock); the shop sees its whole inventory."""
+    """Customers see only what they can buy (in stock); the shop sees its whole inventory, with what open
+    orders hold of each item (still on its shelf)."""
     query = select(Product).where(Product.active)
-    if not has_shop_access(user):
+    shop = has_shop_access(user)
+    if not shop:
         query = query.where(Product.stock > 0)
+    held = held_stock(db) if shop else {}
     products = list(db.scalars(query.order_by(Product.id)))
     popular = _best_sellers(db)
     since = utcnow() - timedelta(days=NEW_DAYS)
@@ -52,7 +55,7 @@ def list_products(user: User = Depends(current_user), db: Session = Depends(get_
     fresh = {p.id for p in newest[:NEW_SHOWN]}
     out = []
     for product in products:
-        item = product_out(product)
+        item = product_out(product, held.get(product.id, 0) if shop else None)
         item.popular = True if product.id in popular else None
         item.is_new = True if product.id in fresh else None
         out.append(item)

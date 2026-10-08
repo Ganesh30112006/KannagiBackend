@@ -188,6 +188,9 @@ class ProductOut(CamelModel):
     # Badges on the customer's shelf (only in the product list; left out when not true).
     popular: bool | None = None  # among the best sellers of the last two weeks
     is_new: bool | None = None  # added in the last week (the newest few)
+    # For the shop only: units in orders not handed over yet. They're off the stock (customers can't
+    # order them again) but still on the shelf, so the shelf has stock + held.
+    held: int | None = None
 
 
 class ProductCreate(Stripped):
@@ -212,6 +215,9 @@ class ProductUpdate(Stripped):
     stock: int | None = Field(default=None, ge=0, le=100_000)
     # Relative change applied atomically, so quick taps or two shopkeepers can't overwrite each other.
     stock_delta: int | None = Field(default=None, ge=-100_000, le=100_000)
+    # What the shopkeeper counted on the shelf. Items for orders not handed over yet are still there but
+    # already off the stock, so the stock becomes the count minus those.
+    shelf: int | None = Field(default=None, ge=0, le=100_000)
     threshold: int | None = Field(default=None, ge=0, le=100_000)
     category: str | None = Field(default=None, min_length=1, max_length=40)
     image: str | None = Field(default=None, max_length=MAX_IMAGE_LENGTH)
@@ -803,3 +809,10 @@ class OrderRequestOut(CamelModel):
     delivery: Delivery
     note: str | None = None
     customer: OrderCustomer | None = None  # for shopkeepers and admins only
+
+
+class GiftIn(CamelModel):
+    """Which item the shop gave for an order's free chocolate or snack (freebies[index]); none: not one from stock."""
+
+    index: int = Field(ge=0, le=20)
+    product_id: int | None = Field(default=None, gt=0, le=MAX_ID)
