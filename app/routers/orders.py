@@ -205,11 +205,15 @@ def place_order(body: OrderIn, background: BackgroundTasks, user: User = Depends
                 sale_price=sale_price(product),
             )
         )
+    # Beside each freebie, the item it took from stock (services.free_stock: cancelling puts it back).
+    order.free_items = [None] * len(order.freebies)
     if deal.free_pick:
-        # The admin's Profit page and cancelling read these (siteadmin.picked_item).
+        # The admin's Profit page and cancelling read these (services.picked_item).
         order.freebies.append(f"{given} (free ₹{deal.pick_value} pick)" if given else f"₹{deal.pick_value} free snack")
+        order.free_items.append(free_pick.id if given else None)
     if reward is not None:
         order.freebies.append(loyalty_pick_text(reward.name, reward_up_to))  # read by services.loyalty
+        order.free_items.append(reward.id)
     # Conditional updates: two orders sent at the same moment can't both use one coupon or the
     # first-order discount.
     if deal.coupon:

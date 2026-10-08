@@ -212,6 +212,7 @@ class ProductUpdate(Stripped):
     name: str | None = Field(default=None, min_length=1, max_length=80)
     mrp: float | None = Field(default=None, gt=0, le=100_000)
     markup: int | None = Field(default=None, ge=0, le=1000)
+    # The same as shelf: pages from before the shelf count send what the shopkeeper counted as this.
     stock: int | None = Field(default=None, ge=0, le=100_000)
     # Relative change applied atomically, so quick taps or two shopkeepers can't overwrite each other.
     stock_delta: int | None = Field(default=None, ge=-100_000, le=100_000)
@@ -666,6 +667,9 @@ class SitePublic(Stripped):
     pickup_enabled: bool = True
     room_delivery_enabled: bool = True
     delivery_fee: int = Field(default=10, ge=0, le=100)  # rupees, room delivery
+    # The shop-wide markup from before each item had its own (Product.markup, set on its card). Pages
+    # from before that still price items with it until they reload; this page doesn't use it.
+    markup: int = Field(default=5, ge=0, le=100)
 
     @field_validator("upi_id")
     @classmethod
@@ -704,9 +708,6 @@ class SiteValues(SitePublic):
     """Everything the site admin sets, including what only the server uses."""
 
     signups_open: bool = True
-    # The shop-wide markup from before each item had its own (Product.markup, set on its card): kept only
-    # to fill those in once (seed.py). Customers don't get it, and saving the settings keeps it.
-    markup: int = Field(default=5, ge=0, le=100)
 
 
 class SiteAdminOut(SiteValues):

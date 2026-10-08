@@ -99,9 +99,13 @@ class Order(Base):
     # UPI orders are placed first and paid after; the shopkeeper ticks this once the money shows up.
     payment_confirmed: Mapped[bool] = mapped_column(Boolean, default=False)
     on_request: Mapped[bool] = mapped_column(Boolean, default=False)
-    # Cancelled by the site admin: its stock went back on the shelf and it no longer counts anywhere.
+    # Cancelled by the shop: its stock went back on the shelf and it no longer counts anywhere.
     cancelled: Mapped[bool] = mapped_column(Boolean, default=False)
     freebies: Mapped[list[str]] = mapped_column(JSON, default=list)
+    # Beside each freebie, the item taken from stock for it (its product id), or None: a free pick, a
+    # loyalty pick or the item the shop gave for a free chocolate or snack. None for the whole list on
+    # orders from before this was kept (services.free_stock then finds the item by its name).
+    free_items: Mapped[list[int | None] | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
     # Who to hand it to, as it was when she ordered (a later profile change doesn't rewrite old orders).
     customer_name: Mapped[str | None] = mapped_column(String(100), nullable=True)

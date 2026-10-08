@@ -73,6 +73,7 @@ ADDED_COLUMNS = {
         "customer_room": "VARCHAR(20)",
         "payment_confirmed": "BOOLEAN NOT NULL DEFAULT FALSE",
         "cancelled": "BOOLEAN NOT NULL DEFAULT FALSE",
+        "free_items": "JSON",
     },
 }
 

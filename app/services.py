@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import ROUND_HALF_UP, Decimal
 
-from sqlalchemy import and_, func, select
+from sqlalchemy import and_, func, select, update
 from sqlalchemy.orm import Session
 
 from .config import settings
@@ -433,6 +433,58 @@ def picked_item(freebie: object) -> str | None:
     return match.group(1) if match else None
 
 
+def name_key(name: str) -> str:
+    """Item names match whatever the capitals and spacing ("Dark  Fantasy" = "dark fantasy")."""
+    return " ".join(name.lower().split())
+
+
+def item_named(db: Session, name: str, *, besides: int | None = None) -> Product | None:
+    """The item on sale with this name (capitals and spacing aside), other than item `besides`."""
+    key = name_key(name)
+    for product in db.scalars(select(Product).where(Product.active).order_by(Product.id)):
+        if product.id != besides and name_key(product.name) == key:
+            return product
+    return None
+
+
+def free_stock(db: Session, orders: list[tuple[list | None, list | None]]) -> list[int]:
+    """The items the orders' freebies took from stock, one product id per unit, from each order's
+    (freebies, free_items). Orders from before free_items was kept name the item only: the first item on
+    sale with that name stands in."""
+    taken: list[int] = []
+    unknown: list[str] = []
+    for freebies, free_items in orders:
+        ids = free_items or []
+        for index, gift in enumerate(freebies or []):
+            if not (name := picked_item(gift)):
+                continue
+            product_id = ids[index] if index < len(ids) else None
+            if isinstance(product_id, int):
+                taken.append(product_id)
+            else:
+                unknown.append(name)
+    if unknown:
+        ids_by_name: dict[str, int] = {}
+        for product_id, name in db.execute(select(Product.id, Product.name).where(Product.name.in_(unknown), Product.active).order_by(Product.id)).tuples():
+            ids_by_name.setdefault(name, product_id)
+        taken += [ids_by_name[name] for name in unknown if name in ids_by_name]
+    return taken
+
+
+def put_back(db: Session, back: dict[int, int]) -> None:
+    """Units back on the shelf (a cancelled order, an undone sale). An item deleted since gives them to the
+    item on sale with its name, if there is one (deleted and added again); otherwise they stay with the
+    deleted item, which nothing counts."""
+    deleted = {product.id: product.name for product in db.scalars(select(Product).where(Product.id.in_(back), Product.active.is_(False)))} if back else {}
+    target: dict[int, int] = {}
+    for product_id, quantity in back.items():
+        if product_id in deleted and (same := item_named(db, deleted[product_id])) is not None:
+            product_id = same.id
+        target[product_id] = target.get(product_id, 0) + quantity
+    for product_id in sorted(target):  # the lock order of every write (see orders.place_order)
+        db.execute(update(Product).where(Product.id == product_id).values(stock=Product.stock + target[product_id]))
+
+
 def held_stock(db: Session) -> dict[int, int]:
     """Units of each item in orders not handed over yet (and not cancelled), free items included. They
     came off the stock when ordered but are still on the shop's shelf."""
@@ -444,15 +496,8 @@ def held_stock(db: Session) -> dict[int, int]:
         .group_by(OrderItem.product_id)
     )
     held = {product_id: int(quantity) for product_id, quantity in db.execute(lines).tuples()}
-    names = [name for freebies in db.scalars(select(Order.freebies).where(still_open)) for gift in freebies or [] if (name := picked_item(gift))]
-    if names:
-        # By name, as cancelling an order finds them to put them back: the first item on sale with it.
-        ids: dict[str, int] = {}
-        for product_id, name in db.execute(select(Product.id, Product.name).where(Product.name.in_(names), Product.active).order_by(Product.id)).tuples():
-            ids.setdefault(name, product_id)
-        for name in names:
-            if name in ids:
-                held[ids[name]] = held.get(ids[name], 0) + 1
+    for product_id in free_stock(db, list(db.execute(select(Order.freebies, Order.free_items).where(still_open)).tuples())):
+        held[product_id] = held.get(product_id, 0) + 1
     return held
 
 

@@ -4,12 +4,12 @@ import re
 from datetime import timedelta
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Response, status
-from sqlalchemy import and_, delete, func, or_, select, update
+from sqlalchemy import and_, delete, func, or_, select
 from sqlalchemy.orm import Session, selectinload
 
 from .. import alerts, sync
 from ..database import get_db, takes_turns
-from ..models import ManualSale, ManualSaleItem, Order, OrderItem, OrderRequest, Product, Profile, StockEntry, User, utcnow
+from ..models import ManualSale, ManualSaleItem, Order, OrderItem, OrderRequest, Product, Profile, Spin, StockEntry, User, utcnow
 from ..schemas import (
     AdminOrderOut,
     FulfilIn,
@@ -40,11 +40,14 @@ from ..services import (
     GIVEN,
     canonical_prize,
     cart_summary,
+    free_stock,
     get_settings,
     held_stock,
+    item_named,
     order_out,
     paise,
     product_out,
+    put_back,
     rupees,
     sale_price,
     to_ms,
@@ -81,6 +84,16 @@ def _forget_image(db: Session, background: BackgroundTasks, url: str | None) -> 
     """After a commit: delete a photo from Cloudinary once no product on sale still shows it."""
     if url and not db.scalar(select(func.count()).where(Product.image_url == url, Product.active)):
         background.add_task(delete_image, url)
+
+
+def _name_taken(db: Session, name: str, product_id: int | None = None) -> None:
+    """One item per name: free items, wishlist requests and Profit find items by their names."""
+    other = item_named(db, name, besides=product_id)
+    if other is not None:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"There's already an item called {other.name}. Change that item's stock on its card, or use another name.",
+        )
 
 
 def _get_product(db: Session, product_id: int, *, lock: bool = False) -> Product:
@@ -136,6 +149,7 @@ def _log_stock(db: Session, product: Product, change: int, user: User) -> None:
 @router.post("/products", response_model=ProductOut, response_model_exclude_none=True, status_code=status.HTTP_201_CREATED)
 def create_product(body: ProductCreate, background: BackgroundTasks, user: User = Depends(shopkeeper), db: Session = Depends(get_db)) -> ProductOut:
     """Its starting stock counts as stock bought. Customers who asked for it hear that it's here."""
+    _name_taken(db, body.name)
     image_url = _save_image(body.image)
     product = Product(
         name=body.name,
@@ -189,18 +203,18 @@ def _apply_update(db: Session, product_id: int, body: ProductUpdate, image_url: 
     product = _get_product(db, product_id, lock=True)
     old_image, old_stock, old_name = product.image_url, product.stock, product.name
     fields = body.model_fields_set
-    if "name" in fields and body.name:
+    if "name" in fields and body.name and body.name != product.name:
+        _name_taken(db, body.name, product.id)
         product.name = body.name
     if "mrp" in fields and body.mrp is not None:
         product.purchase_price = body.mrp
     if "markup" in fields and body.markup is not None:
         product.markup = body.markup
-    if "stock" in fields and body.stock is not None:
-        product.stock = body.stock
-    if "shelf" in fields and body.shelf is not None:
+    counted = body.shelf if "shelf" in fields else body.stock if "stock" in fields else None
+    if counted is not None:
         # Read under the item's lock: an order for it now either went in before (and is counted here) or
         # waits, and then takes its stock from what this leaves.
-        product.stock = max(0, body.shelf - held_stock(db).get(product.id, 0))
+        product.stock = max(0, counted - held_stock(db).get(product.id, 0))
     if body.stock_delta:
         wanted = product.stock + body.stock_delta
         if wanted > MAX_STOCK:
@@ -231,6 +245,7 @@ def delete_product(product_id: IdPath, background: BackgroundTasks, user: User =
     product = _get_product(db, product_id, lock=True)
     product.active = False
     _log_stock(db, product, -product.stock, user)  # its stock leaves the shop's stock
+    product.stock = 0
     sync.bump(db, sync.CATALOG)
     db.commit()
     _forget_image(db, background, product.image_url)
@@ -383,8 +398,7 @@ def undo_manual_sale(sale_id: IdPath, db: Session = Depends(get_db)) -> ManualSa
     for item in sale.items:
         if item.product_id is not None:
             back[item.product_id] = back.get(item.product_id, 0) + item.quantity
-    for product_id in sorted(back):
-        db.execute(update(Product).where(Product.id == product_id).values(stock=Product.stock + back[product_id]))
+    put_back(db, back)
     sale.cancelled = True
     sync.bump(db, sync.ORDERS, sync.CATALOG)
     db.commit()
@@ -452,8 +466,10 @@ def give_gift(order_id: IdPath, body: GiftIn, db: Session = Depends(get_db)) -> 
         value, kind = given.group(2), given.group(3)
     else:
         value, kind = generic.group(1), "chocolate" if generic.group(2).startswith("chocolate") else "snack"
-    before = given.group(1) if given is not None else None
-    previous = db.scalar(select(Product.id).where(Product.name == before, Product.active).order_by(Product.id).limit(1)) if before else None
+    # The item given before (it goes back): kept beside the freebie, or found by its name on older orders.
+    ids = list(order.free_items or [])
+    ids += [None] * (len(freebies) - len(ids))
+    previous = (free_stock(db, [([text], [ids[body.index]])]) or [None])[0] if given is not None else None
     chosen = db.scalar(select(Product).where(Product.id == body.product_id, Product.active)) if body.product_id else None
     if body.product_id and chosen is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "That item isn't on sale. Refresh the page.")
@@ -462,7 +478,7 @@ def give_gift(order_id: IdPath, body: GiftIn, db: Session = Depends(get_db)) -> 
     for product_id in sorted({previous, chosen.id if chosen else None} - {None}):
         db.execute(select(Product.id).where(Product.id == product_id).with_for_update())
         if product_id == previous:
-            db.execute(update(Product).where(Product.id == product_id).values(stock=Product.stock + 1))
+            put_back(db, {product_id: 1})
         elif not _take(db, product_id, 1):
             db.rollback()
             raise HTTPException(status.HTTP_409_CONFLICT, f"No {chosen.name} left in stock. Pick another item, or correct its stock first.")
@@ -470,10 +486,62 @@ def give_gift(order_id: IdPath, body: GiftIn, db: Session = Depends(get_db)) -> 
         freebies[body.index] = f"{chosen.name} (free ₹{value} {kind})"
     else:
         freebies[body.index] = f"₹{value} chocolate (free)" if kind == "chocolate" else f"₹{value} free snack"
-    order.freebies = freebies
+    ids[body.index] = chosen.id if chosen is not None else None
+    order.freebies, order.free_items = freebies, ids
     sync.bump(db, sync.ORDERS, sync.CATALOG)
     db.commit()
     return _with_customers(db, [order])[0]
+
+
+def cancel(db: Session, order_id: int) -> AdminOrderOut:
+    """Cancels an order that hasn't been handed over: its items (and any free item from stock) go back on
+    the shelf, an unexpired spin coupon it used works again, and a first-order discount is available again
+    if this was her only order. It no longer counts in sales. If she paid by UPI, the money is returned
+    outside the app."""
+    placed = db.get(Order, order_id)
+    if placed is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Order not found.")
+    # The lock order of orders.place_order: the customer, then the order, then products by number. The
+    # order is read again under its lock, so two cancels at once put the stock back only once.
+    db.execute(select(User.id).where(User.id == placed.user_id).with_for_update(key_share=True))
+    order = db.get(Order, order_id, options=[selectinload(Order.items)], with_for_update=True, populate_existing=True)
+    if order.cancelled:
+        raise HTTPException(status.HTTP_409_CONFLICT, "This order is already cancelled.")
+    if order.fulfilled:
+        raise HTTPException(status.HTTP_409_CONFLICT, "This order was handed over. Undo 'fulfilled' first.")
+    back: dict[int, int] = {}  # product id -> how many go back on the shelf
+    for item in order.items:
+        if item.product_id is not None:
+            back[item.product_id] = back.get(item.product_id, 0) + item.quantity
+    for product_id in free_stock(db, [(order.freebies, order.free_items)]):
+        back[product_id] = back.get(product_id, 0) + 1
+    put_back(db, back)
+    if order.coupon:
+        coupon = db.scalar(
+            select(Spin)
+            .where(Spin.user_id == order.user_id, Spin.code == order.coupon, Spin.used_at.is_not(None))
+            .order_by(Spin.used_at.desc())
+            .limit(1)
+        )
+        if coupon is not None and coupon.expires_at is not None and coupon.expires_at > utcnow():
+            coupon.used_at = None
+    order.cancelled = True
+    others = db.scalar(select(func.count()).where(Order.user_id == order.user_id, Order.id != order.id, Order.cancelled.is_(False)))
+    customer = db.get(User, order.user_id)
+    if customer is not None and not others:
+        customer.first_order_used = False
+    sync.bump(db, sync.ORDERS, sync.CATALOG)
+    db.commit()
+    return _with_customers(db, [order])[0]
+
+
+@router.post("/orders/{order_id}/cancel", response_model=AdminOrderOut, response_model_exclude_none=True)
+@takes_turns
+def cancel_order(order_id: IdPath, background: BackgroundTasks, db: Session = Depends(get_db)) -> AdminOrderOut:
+    """For an order that won't be handed over (never paid for, nobody came): see cancel. Her devices hear it."""
+    order = cancel(db, order_id)
+    background.add_task(alerts.order_update, order.id, "cancelled")
+    return order
 
 
 @router.post("/orders/{order_id}/payment", response_model=AdminOrderOut, response_model_exclude_none=True)

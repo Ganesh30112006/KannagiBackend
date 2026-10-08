@@ -64,7 +64,7 @@ from ..schemas import (
 from ..security import create_token, hash_password, site_admin, verify_password
 from ..services import MARKUP, get_settings, is_egg, markup_of, paise, picked_item, rupees, sale_price, shop_now, store_online, to_ms, user_out
 from ..staff import is_owner
-from .admin import _with_customers
+from .admin import _with_customers, cancel
 from .shop import clear_wishes
 
 router = APIRouter(prefix="/site-admin", tags=["site admin"], dependencies=[Depends(site_admin)])
@@ -313,11 +313,11 @@ def profit(period: InvestmentPeriod = "month", db: Session = Depends(get_db)) ->
     # orders or undone manual sales.
     counted = and_(Order.cancelled.is_(False), or_(Order.payment != "UPI", Order.payment_confirmed.is_(True)), *within(Order.created_at))
     kept = and_(ManualSale.cancelled.is_(False), *within(ManualSale.created_at))
-    orders = _sales(db, [Order.id, Order.created_at, Order.total, Order.discount, Order.freebies], OrderItem, OrderItem.order_id == Order.id, counted)
+    orders = _sales(db, [Order.id, Order.created_at, Order.total, Order.discount, Order.freebies, Order.free_items], OrderItem, OrderItem.order_id == Order.id, counted)
     manual_sales = _sales(db, [ManualSale.id, ManualSale.created_at, ManualSale.total], ManualSaleItem, ManualSaleItem.sale_id == ManualSale.id, kept)
 
     # Items by name now (on sale first, then the newest): emojis, and what a free pick cost.
-    picks = {name for (*_, freebies), _ in orders for gift in freebies or [] if (name := picked_item(gift))}
+    picks = {name for (*_, freebies, _), _ in orders for gift in freebies or [] if (name := picked_item(gift))}
     names = {name for _, lines in (*orders, *manual_sales) for name, *_ in lines} | picks
     catalog = {
         product.name: product
@@ -329,14 +329,20 @@ def profit(period: InvestmentPeriod = "month", db: Session = Depends(get_db)) ->
         eggs = catalog.get(name)
         return (MARKUP if eggs is None else markup_of(eggs)) * 100
 
-    def gifts_cost(freebies) -> int:
+    # The items free gifts took from stock, by number (orders keep them beside their freebies).
+    given_ids = {item for (*_, free_items), _ in orders for item in free_items or [] if isinstance(item, int)}
+    given = {product.id: product for product in db.scalars(select(Product).where(Product.id.in_(given_ids)))} if given_ids else {}
+
+    def gifts_cost(freebies, free_items) -> int:
         """At the price of the gift: a free pick at its item's MRP; "₹5 chocolate (free)" at ₹5."""
         cost = 0
-        for gift in freebies or []:
+        ids = free_items or []
+        for index, gift in enumerate(freebies or []):
             if not isinstance(gift, str):
                 continue
             name = picked_item(gift)
-            picked = catalog.get(name) if name else None
+            item = ids[index] if index < len(ids) else None
+            picked = given.get(item) if isinstance(item, int) else (catalog.get(name) if name else None)
             if picked is not None:
                 cost += paise(picked.purchase_price)
             elif found := GIFT_PRICE.search(gift):
@@ -361,9 +367,9 @@ def profit(period: InvestmentPeriod = "month", db: Session = Depends(get_db)) ->
     online, manual = _Tally(), _Tally()
     days: dict[date, tuple[_Tally, _Tally]] = {}
     fees = discounts = changes = 0
-    for (_, created_at, total, discount, freebies), lines in orders:
+    for (_, created_at, total, discount, freebies, free_items), lines in orders:
         value, cost, units = items_value(lines)
-        received, off, gifts = paise(total), paise(discount), gifts_cost(freebies)
+        received, off, gifts = paise(total), paise(discount), gifts_cost(freebies, free_items)
         fees += received + off - value  # total = items + delivery fee - discount
         discounts += off
         online.add(received, cost, units, gifts)
@@ -762,47 +768,7 @@ def all_orders(
 @router.post("/orders/{order_id}/cancel", response_model=AdminOrderOut, response_model_exclude_none=True)
 @takes_turns
 def cancel_order(order_id: IdPath, background: BackgroundTasks, db: Session = Depends(get_db)) -> AdminOrderOut:
-    """Cancels an order that hasn't been handed over: its items (and any free pick) go back on the
-    shelf, an unexpired spin coupon it used works again, and a first-order discount is available again
-    if this was her only order. It no longer counts in sales. If she paid by UPI, the money is
-    returned outside the app."""
-    placed = db.get(Order, order_id)
-    if placed is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Order not found.")
-    # The lock order of orders.place_order: the customer, then the order, then products by number. The
-    # order is read again under its lock, so two cancels at once put the stock back only once.
-    db.execute(select(User.id).where(User.id == placed.user_id).with_for_update(key_share=True))
-    order = db.get(Order, order_id, options=[selectinload(Order.items)], with_for_update=True, populate_existing=True)
-    if order.cancelled:
-        raise HTTPException(status.HTTP_409_CONFLICT, "This order is already cancelled.")
-    if order.fulfilled:
-        raise HTTPException(status.HTTP_409_CONFLICT, "This order was handed over. Undo 'fulfilled' first.")
-    back: dict[int, int] = {}  # product id -> how many go back on the shelf
-    for item in order.items:
-        if item.product_id is not None:
-            back[item.product_id] = back.get(item.product_id, 0) + item.quantity
-    for freebie in order.freebies or []:
-        if name := picked_item(freebie):
-            product_id = db.scalar(select(Product.id).where(Product.name == name, Product.active).order_by(Product.id).limit(1))
-            if product_id is not None:
-                back[product_id] = back.get(product_id, 0) + 1
-    for product_id in sorted(back):
-        db.execute(update(Product).where(Product.id == product_id).values(stock=Product.stock + back[product_id]))
-    if order.coupon:
-        coupon = db.scalar(
-            select(Spin)
-            .where(Spin.user_id == order.user_id, Spin.code == order.coupon, Spin.used_at.is_not(None))
-            .order_by(Spin.used_at.desc())
-            .limit(1)
-        )
-        if coupon is not None and coupon.expires_at is not None and coupon.expires_at > utcnow():
-            coupon.used_at = None
-    order.cancelled = True
-    others = db.scalar(select(func.count()).where(Order.user_id == order.user_id, Order.id != order.id, Order.cancelled.is_(False)))
-    customer = db.get(User, order.user_id)
-    if customer is not None and not others:
-        customer.first_order_used = False
-    sync.bump(db, sync.ORDERS, sync.CATALOG)
-    db.commit()
+    """See admin.cancel (shopkeepers cancel there too)."""
+    order = cancel(db, order_id)
     background.add_task(alerts.order_update, order.id, "cancelled")  # her devices hear it
-    return _with_customers(db, [order])[0]
+    return order
